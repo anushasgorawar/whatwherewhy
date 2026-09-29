@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pod-observer-backend
+  namespace: pod-observer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pod-observer-backend
+  template:
+    metadata:
+      labels:
+        app: pod-observer-backend
+    spec:
+      serviceAccountName: pod-observer-backend
+      containers:
+        - name: backend
+          image: pod-observer-backend:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: PROMETHEUS_URL
+              value: "http://prometheus.monitoring.svc.cluster.local:9090"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
