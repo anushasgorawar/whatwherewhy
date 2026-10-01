@@ -3,54 +3,33 @@
 This repository now includes a no-AI observability stack for local Kubernetes (Rancher Desktop):
 
 - `frontend/`: React UI for pod status, manual refresh, and logs view (runs locally, not in Kubernetes).
-- `backend/`: Node/Express API for pods, logs, and Prometheus-backed metrics.
-- `k8s/app/`: app namespace, RBAC, backend deployment, backend service.
-- `k8s/metrics/`: Prometheus, kube-state-metrics, and metrics-server manifests.
+- `backend/`: local Node/Express API for pods, logs, and Kubernetes Metrics API data.
+- `k8s/app/`: optional deployment manifests retained for reference; not used by the local workflow.
+- `k8s/metrics/`: optional Prometheus and kube-state-metrics manifests.
 
 ## Features
 
-- List pods by namespace.
+- Fetch all cluster namespaces and select one from a dropdown.
+- List pods for the selected namespace.
 - Refresh pod list on demand.
 - Fetch fresh pod logs on every log refresh action.
-- Display basic pod CPU metrics from Prometheus (when available).
+- Display real pod CPU and memory data from the Kubernetes Metrics API.
 
 ## Prerequisites
 
 - Rancher Desktop Kubernetes cluster running.
 - `kubectl` configured for your local cluster.
-- Docker/nerdctl image build capability.
+- Node.js and npm.
 
-## Build Images
-
-Rancher Desktop commonly uses containerd for Kubernetes. Build the backend image into the Kubernetes image namespace:
+## Optional Monitoring Stack
 
 ```bash
 cd /Users/anushasg/www
-nerdctl -n k8s.io build -t pod-observer-backend:0.1.0 ./backend
-```
-
-If your setup uses Docker Engine instead, use:
-
-```bash
-docker build -t pod-observer-backend:0.1.0 ./backend
-```
-
-## Deploy Metrics Stack
-
-```bash
-cd /Users/anushasg/www
-kubectl apply -f k8s/metrics/
+kubectl apply -k k8s/metrics
 kubectl -n monitoring get pods
 ```
 
-## Deploy App Stack
-
-```bash
-cd /Users/anushasg/www
-kubectl apply -f k8s/app/
-kubectl -n pod-observer get pods
-kubectl -n pod-observer get svc
-```
+`k8s/metrics` intentionally excludes `metrics-server.yaml` from the default kustomization to avoid conflicts with cluster-managed metrics-server installs (common in Rancher Desktop).
 
 ## Run Local React UI (outside Kubernetes)
 
@@ -62,15 +41,17 @@ npm run dev
 
 The UI runs at `http://localhost:5173`.
 
-## Connect Local UI to In-Cluster Backend
+## Run Local Backend
 
-In a second terminal:
+In another terminal:
 
 ```bash
-kubectl -n pod-observer port-forward svc/pod-observer-backend 8080:8080
+cd /Users/anushasg/www/backend
+npm install
+npm run dev
 ```
 
-By default, the UI calls `http://localhost:8080`.
+The backend runs at `http://localhost:8080`, uses your active kubeconfig, and requires no container image or port-forward.
 
 If needed, override API base:
 
@@ -82,7 +63,7 @@ VITE_API_BASE=http://localhost:8080 npm run dev
 ## Verify Backend and Logs
 
 ```bash
-kubectl -n pod-observer logs deploy/pod-observer-backend
+curl http://localhost:8080/healthz
 kubectl get pods -A
 ```
 
@@ -105,6 +86,17 @@ Open `http://localhost:9090/targets` and verify scrape targets are up.
 
 ## Notes
 
-- Backend uses in-cluster config when deployed, and local kubeconfig when run locally.
+- Backend runs locally and uses the active kubeconfig to access Kubernetes.
 - Frontend is intentionally local-only in this setup and is not deployed to Kubernetes.
-- If Prometheus is unavailable, metrics endpoint degrades gracefully (pods/logs still work).
+- Pod logs come from the Kubernetes API, and CPU/memory metrics come directly from the Kubernetes Metrics API.
+
+## Optional One-Command Startup
+
+To verify Kubernetes access and open two Terminal tabs (frontend dev server and local backend dev server):
+
+```bash
+cd /Users/anushasg/www
+./start-dev-stack.sh
+```
+
+The script does not build an image or deploy the application backend to Kubernetes. The backend runs locally on port `8080` and accesses the cluster through your active kubeconfig.

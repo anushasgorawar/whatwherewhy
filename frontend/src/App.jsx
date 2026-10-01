@@ -1,14 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchLogs, fetchPodMetrics, fetchPods } from "./api";
+import { fetchLogs, fetchNamespaces, fetchPodMetrics, fetchPods } from "./api";
 
 export default function App() {
   const [namespace, setNamespace] = useState("default");
+  const [namespaces, setNamespaces] = useState([]);
   const [pods, setPods] = useState([]);
   const [metrics, setMetrics] = useState([]);
   const [selectedPod, setSelectedPod] = useState("");
   const [tail, setTail] = useState(200);
   const [logs, setLogs] = useState("");
   const [loadingPods, setLoadingPods] = useState(false);
+  const [loadingNamespaces, setLoadingNamespaces] = useState(true);
   const [loadingLogs, setLoadingLogs] = useState(false);
   const [loadingMetrics, setLoadingMetrics] = useState(false);
   const [error, setError] = useState("");
@@ -19,6 +21,23 @@ export default function App() {
     [pods, selectedPod]
   );
 
+  async function loadNamespaces() {
+    setLoadingNamespaces(true);
+    setError("");
+    try {
+      const data = await fetchNamespaces();
+      const nextNamespaces = data.namespaces || [];
+      setNamespaces(nextNamespaces);
+      if (nextNamespaces.length && !nextNamespaces.includes(namespace)) {
+        setNamespace(nextNamespaces[0]);
+      }
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoadingNamespaces(false);
+    }
+  }
+
   async function refreshPods() {
     setLoadingPods(true);
     setError("");
@@ -27,6 +46,8 @@ export default function App() {
       setPods(data.pods || []);
       if (data.pods?.length && !data.pods.find((pod) => pod.name === selectedPod)) {
         setSelectedPod(data.pods[0].name);
+      } else if (!data.pods?.length) {
+        setSelectedPod("");
       }
     } catch (err) {
       setError(err.message);
@@ -72,6 +93,11 @@ export default function App() {
   }
 
   useEffect(() => {
+    loadNamespaces();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
     refreshPods();
     refreshMetrics();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -87,7 +113,21 @@ export default function App() {
       <section className="controls">
         <label>
           Namespace:
-          <input value={namespace} onChange={(e) => setNamespace(e.target.value)} />
+          <select
+            value={namespace}
+            onChange={(e) => setNamespace(e.target.value)}
+            disabled={loadingNamespaces || namespaces.length === 0}
+          >
+            {loadingNamespaces && <option value={namespace}>Loading namespaces...</option>}
+            {!loadingNamespaces && namespaces.length === 0 && (
+              <option value="">No namespaces available</option>
+            )}
+            {namespaces.map((item) => (
+              <option key={item} value={item}>
+                {item}
+              </option>
+            ))}
+          </select>
         </label>
         <button onClick={refreshPods} disabled={loadingPods}>
           {loadingPods ? "Refreshing pods..." : "Refresh Pods"}

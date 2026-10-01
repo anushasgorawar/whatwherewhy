@@ -7,4 +7,3 @@ resources:
   - prometheus-rbac.yaml
   - prometheus-configmap.yaml
   - prometheus.yaml
-  - metrics-server.yaml

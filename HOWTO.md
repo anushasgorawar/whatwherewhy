@@ -33,14 +33,24 @@ Backend health:
 curl http://localhost:8080/healthz
 ```
 
-### 3) Build backend image for Rancher Desktop k8s runtime
+Verify namespace discovery:
+
+```bash
+curl http://localhost:8080/api/namespaces
+```
+
+### 3) Optional legacy path: build backend image
+
+This is not required for the default local-backend workflow.
 
 ```bash
 cd /Users/anushasg/www
 nerdctl -n k8s.io build -t pod-observer-backend:0.1.0 ./backend
 ```
 
-### 4) Deploy app backend resources to Kubernetes
+### 4) Optional legacy path: deploy app backend resources
+
+This is not required for the default local-backend workflow.
 
 ```bash
 cd /Users/anushasg/www
@@ -54,15 +64,17 @@ kubectl apply -f k8s/app/backend-service.yaml
 
 ```bash
 cd /Users/anushasg/www
-kubectl apply -f k8s/metrics/namespace.yaml
-kubectl apply -f k8s/metrics/kube-state-metrics-rbac.yaml
-kubectl apply -f k8s/metrics/kube-state-metrics.yaml
-kubectl apply -f k8s/metrics/prometheus-rbac.yaml
-kubectl apply -f k8s/metrics/prometheus-configmap.yaml
-kubectl apply -f k8s/metrics/prometheus.yaml
+kubectl apply -k k8s/metrics
 ```
 
-Note: on Rancher Desktop, metrics-server is often already present in `kube-system`. Avoid reapplying `k8s/metrics/metrics-server.yaml` unless intentionally replacing the cluster's default metrics-server.
+Note: on Rancher Desktop, metrics-server is often already present in `kube-system`. The default `k8s/metrics` kustomization excludes `metrics-server.yaml` to avoid deployment conflicts.
+
+If you intentionally need this repository's metrics-server manifest:
+
+```bash
+cd /Users/anushasg/www
+kubectl apply -f k8s/metrics/metrics-server.yaml
+```
 
 ### 6) Verify deployments
 
@@ -99,3 +111,20 @@ Prometheus pod logs:
 ```bash
 kubectl -n monitoring logs deploy/prometheus
 ```
+
+## 10) One-command local startup
+
+Use the helper script to verify Kubernetes access and open two Terminal tabs:
+
+```bash
+cd /Users/anushasg/www
+./start-dev-stack.sh
+```
+
+What the script does:
+- Verifies access to the current Kubernetes cluster.
+- Checks whether the Kubernetes Metrics API is available and prints a warning if it is not.
+- Opens Terminal tab 1 for frontend dev server (`frontend`: `npm install && npm run dev`).
+- Opens Terminal tab 2 for backend local dev server (`backend`: `npm install && npm run dev`).
+
+No application image is built, no application pod is deployed, and no port-forward is needed. The local backend uses the active kubeconfig to retrieve pod lists, pod logs, and real CPU/memory data from `metrics.k8s.io`.

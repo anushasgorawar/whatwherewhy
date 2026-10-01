@@ -14,7 +14,7 @@ These decisions are now final unless explicitly changed:
    - **What Broke, Why, and Now What?: Designing Interactive AI for Incident Response**
 3. Current implementation phase contains **no AI decision logic** in code.
 4. React UI runs locally; it is not deployed on Kubernetes.
-5. Kubernetes backend and observability components run in cluster.
+5. The backend runs locally and accesses Kubernetes through the active kubeconfig; no application backend pod is required.
 6. Metrics shown in UI must be real telemetry only (no synthetic/fallback metrics).
 7. Every meaningful code/documentation change must update:
    - `Paper.md` (research-style progress), and
@@ -45,7 +45,7 @@ Maintain a functional local observability prototype that demonstrates:
 
 - `frontend/`: local React UI
 - `backend/`: Node API for pods/logs/metrics
-- `k8s/app/`: backend namespace/RBAC/deployment/service manifests
+- `k8s/app/`: optional backend deployment manifests retained for reference, not used by the default local workflow
 - `k8s/metrics/`: monitoring manifests
 - `README.md`: user-facing setup/deploy instructions
 - `HOWTO.md`: operator command log
@@ -55,7 +55,7 @@ Maintain a functional local observability prototype that demonstrates:
 ### Runtime architecture
 
 - Frontend: local development server (`localhost:5173`)
-- Backend: local process or in-cluster service
+- Backend: local development process (`localhost:8080`)
 - Cluster data sources:
   - Core Kubernetes API (pods/logs)
   - Metrics API (`metrics.k8s.io/v1beta1`) via metrics-server
@@ -84,7 +84,7 @@ Goal: maintain a working non-AI observability interface aligned with the researc
 - [x] Pod list endpoint implemented and wired to UI.
 - [x] Logs endpoint implemented with explicit user-triggered refresh.
 - [x] Frontend runs locally and calls backend via configured API base.
-- [x] Backend configuration supports local and in-cluster runtime modes.
+- [x] Backend runs locally and accesses cluster data through kubeconfig.
 - [x] Metrics endpoint uses real Kubernetes metrics only.
 - [ ] End-to-end validation pass on clean local cluster with reproducible transcript.
 
@@ -93,20 +93,19 @@ Acceptance criteria:
 - User can load UI, select namespace, view pods, and fetch logs on demand.
 - Metrics shown in UI come from real runtime measurements (or fail with explicit error).
 
-## Milestone C: Kubernetes Deployment Reliability
+## Milestone C: Kubernetes Metrics Reliability
 
-Goal: ensure predictable deployment behavior in Rancher Desktop environments.
+Goal: ensure predictable metrics access in Rancher Desktop environments.
 
-- [x] Backend manifests for namespace/RBAC/deployment/service are present.
-- [x] Monitoring manifests are present and apply in expected order.
-- [ ] Remove/guard cluster-conflicting metrics-server manifest path for default Rancher installs.
+- [x] Optional monitoring manifests are present and apply in expected order.
+- [x] Cluster-conflicting metrics-server manifest is excluded from the default kustomization.
 - [ ] Add deployment health checks and known-failure remedies to docs.
 
 Acceptance criteria:
 
-- Backend pods reach Ready in `pod-observer`.
-- Monitoring pods (Prometheus, kube-state-metrics) reach Ready in `monitoring`.
-- Deployment instructions do not require ad-hoc corrections.
+- Local backend can retrieve logs through the Kubernetes API.
+- Local backend can retrieve CPU and memory data through `metrics.k8s.io`.
+- Optional monitoring deployment instructions do not require ad-hoc corrections.
 
 ## Milestone D: Documentation and Reproducibility Discipline
 

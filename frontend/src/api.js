@@ -9,6 +9,10 @@ async function request(path) {
   return response.json();
 }
 
+export async function fetchNamespaces() {
+  return request("/api/namespaces");
+}
+
 export async function fetchPods(namespace = "default") {
   return request(`/api/pods?namespace=${encodeURIComponent(namespace)}`);
 }

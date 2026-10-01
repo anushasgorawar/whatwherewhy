@@ -43,7 +43,7 @@ The planning artifact has been finalized in `PLANS.md` with:
 - a reusable `AGENTS.md` template to standardize future collaboration rules, documentation obligations, and agent operating constraints
 - a populated `AGENTS.md` policy baseline that operationalizes project priorities, documentation-sync requirements, terminology controls, and guardrails for future agent edits
 - an implemented local Kubernetes observability prototype (`React + Node + Kubernetes manifests`) that operationalizes the "What Broke / Why / Now What" interaction structure without AI decision logic
-- an architecture correction that keeps the React interface local (outside Kubernetes) while retaining in-cluster backend and metrics components for Kubernetes data access
+- an architecture correction that keeps both the React interface and backend local while using kubeconfig for Kubernetes data access
 - a backend configuration fix that distinguishes local runtime from in-cluster runtime to prevent Kubernetes client initialization failures (`Invalid URL`) during local development
 - a metrics fallback strategy that surfaces pod-phase data from kube-state-metrics when Prometheus CPU usage series are unavailable, improving observability continuity in local clusters
 - a strict real-metrics update that removes fallback behavior and sources pod CPU/memory directly from Kubernetes metrics-server (`metrics.k8s.io`), ensuring the UI shows only actual telemetry
@@ -55,7 +55,7 @@ The planning artifact has been finalized in `PLANS.md` with:
 A functional, deployable baseline has been added to support incident investigation workflows on local Kubernetes:
 
 - **Frontend (`frontend/`)**: a React interface for namespace selection, pod list refresh, pod selection, and explicit on-demand log retrieval.
-- **Backend (`backend/`)**: an Express API that reads Kubernetes pods and logs through service-account permissions and exposes metrics data from Prometheus where available.
+- **Backend (`backend/`)**: a local Express API that uses kubeconfig to read Kubernetes pods, logs, and real resource data from the Kubernetes Metrics API.
 - **Infrastructure manifests (`k8s/app/`, `k8s/metrics/`)**: raw Kubernetes YAML for backend deployment, RBAC controls, Prometheus, kube-state-metrics, and metrics-server.
 
 ## Architecture Adjustment Note
@@ -63,8 +63,8 @@ A functional, deployable baseline has been added to support incident investigati
 To align with the requirement that the React UI should not be deployed on Kubernetes, the frontend deployment/service manifests were removed from the app stack. The operational model is now:
 
 - Run frontend locally for interaction and visualization.
-- Port-forward backend service from cluster to local machine.
-- Keep backend and metrics components in-cluster for authenticated Kubernetes and monitoring data access.
+- Run backend locally and use the active kubeconfig for authenticated cluster access.
+- Use the cluster-provided Metrics API for real CPU and memory data.
 
 This prototype advances the research objective by enabling direct observation of how evidence presentation (pod state, logs, and metrics) affects operator understanding before action.
 
@@ -82,9 +82,25 @@ To reduce environment drift and execution ambiguity, the repository now includes
 
 ## Planning Consolidation Update
 
-`PLANS.md` has been rewritten to match the actual project state and remove generic planning boilerplate. The new plan explicitly locks key decisions (HCI framing, local UI / in-cluster backend split, no-AI implementation phase, real-metrics-only policy), and introduces milestone-based tracking with clear acceptance conditions. This improves advisor readability and reduces ambiguity between research intent and implementation activity.
+`PLANS.md` has been rewritten to match the actual project state and remove generic planning boilerplate. The plan explicitly locks key decisions (HCI framing, local UI and backend, no-AI implementation phase, real-metrics-only policy), and introduces milestone-based tracking with clear acceptance conditions. This improves advisor readability and reduces ambiguity between research intent and implementation activity.
 
 This document (`Paper.md`) now serves as the research-style running record of decisions and progress.
+
+## Developer Workflow Automation Update
+
+A repository-level startup script (`start-dev-stack.sh`) has been added to reduce setup friction during prototype iteration. The script verifies cluster and Metrics API access, then opens two Terminal tabs for the local workflow: frontend development server and backend development server. It does not build a container image, deploy an application backend pod, or require a port-forward. This change matters to the research direction because it improves reproducibility while keeping the prototype lightweight. Next, the same scripted flow should be validated on a clean machine profile and, if stable, integrated into advisor-facing onboarding notes.
+
+## Metrics Deployment Compatibility Update
+
+The default monitoring deployment path has been adjusted to avoid `metrics-server` conflicts in local clusters that already manage this component (for example, Rancher Desktop defaults). Specifically, `k8s/metrics/kustomization.yaml` now excludes `metrics-server.yaml`, and documentation has been updated to treat that manifest as an explicit opt-in step. This improves setup reliability by reducing apply-time failures that interrupt iterative interface evaluation. Next, deployment validation should confirm that required telemetry remains available across both cluster-managed and manually managed metrics-server setups.
+
+## Local Backend Simplification Update
+
+The default workflow now runs the backend only as a local Node process. Pod discovery and log retrieval use the Kubernetes API through the active kubeconfig, while CPU and memory measurements use `metrics.k8s.io`. Removing image builds, application deployment, and port-forwarding avoids unnecessary infrastructure and reduces failure modes during prototype evaluation. Next, the local workflow should be validated against the namespaces used in planned interface studies.
+
+## Namespace Discovery Update
+
+The prototype now retrieves all namespaces visible through the active kubeconfig and presents them in a selection control rather than requiring operators to type a namespace. This reduces recall demands and input errors during incident investigation while making the available scope explicit. Pod, log, and metrics requests continue to use the operator-selected namespace. Next, evaluation should examine whether namespace visibility helps users orient themselves more quickly during diagnosis.
 
 ## Next Paper-Facing Steps
 

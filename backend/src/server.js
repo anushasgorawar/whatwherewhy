@@ -28,6 +28,20 @@ app.get("/healthz", (_req, res) => {
   res.json({ ok: true });
 });
 
+app.get("/api/namespaces", async (_req, res) => {
+  try {
+    const { core } = getClients();
+    const list = await core.listNamespace();
+    const namespaces = (list.items || [])
+      .map((item) => item.metadata?.name)
+      .filter(Boolean)
+      .sort();
+    res.json({ namespaces });
+  } catch (err) {
+    res.status(500).json({ error: err.message || "Failed to fetch namespaces" });
+  }
+});
+
 app.get("/api/pods", async (req, res) => {
   try {
     const { namespace } = namespaceSchema.parse(req.query);
