@@ -8,6 +8,26 @@ Incident responders often rely on command-line tools to inspect pod logs and res
 This project investigates how to design an AI-assisted incident response workflow that preserves human control while improving speed and clarity during software failure investigation. The current project direction formalizes a three-stage interaction model: (1) What broke? for diagnosis, (2) Why? for evidence-backed explanation, and (3) Now what? for recommendation with explicit human approval. The project framing has been intentionally shifted from product-style language to HCI research language, with emphasis on explainability, trust, and decision accountability.
 -->
 
+## Motivation: CLI Density and Cognitive Load
+
+The current command-line workflow for local incident investigation is operationally powerful but interaction-heavy. Responders must remember exact command forms, pod names, namespace scoping, and command order while simultaneously interpreting failures. This produces avoidable cognitive overhead during time-sensitive diagnosis, especially when operators need to correlate pod status, resource pressure, and logs.
+
+![Terminal workflow density](/Users/anushasg/www/terminal.png)
+
+In practice, even a basic pod check often requires multiple commands and mental joins (for example, `kubectl get pods -n simulation`, `kubectl top pods -n simulation`, and `kubectl logs ...`). The key design objective of the UI is not to replace Kubernetes tooling, but to reduce repetitive command recall and cross-referencing effort by showing the same evidence in one place.
+
+## HCI Rationale and Applied Principles
+
+The interface decisions in this prototype map to established HCI principles:
+
+- **Recognition rather than recall** (Nielsen): namespace selection and pod lists reduce memory dependence on exact resource names and flags.
+- **Visibility of system status** (Nielsen): 5-second live updates for pod state/metrics and explicit log polling status communicate freshness and liveness.
+- **Consistency and standards** (Nielsen): uniform table structure and repeated visual encodings (phase chips, warning cues) reduce interpretation switching costs.
+- **Aesthetic and minimalist design** (Nielsen): control-bar simplification removes non-essential refresh controls for pods/metrics and keeps actions focused.
+- **Information reduction and integrated context** (HCI decision-support principle): combining pod status and metrics in one table removes the need to reconcile separate views or separate CLI command outputs.
+
+These rules apply directly to the observed CLI pain point: command syntax is still available when needed, but the default path emphasizes low-friction evidence review before action.
+
 ## Current Framing and Research Direction
 
 The project is now positioned as an HCI research effort rather than a product proposal. The paper title has been finalized as:
