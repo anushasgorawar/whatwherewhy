@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { fetchLogs, fetchNamespaces, fetchPodMetrics, fetchPods } from "./api";
 
+const PODS_AND_METRICS_POLL_MS = 5000;
+const LOGS_POLL_MS = 5000;
+
 export default function App() {
   const [namespace, setNamespace] = useState("default");
   const [namespaces, setNamespaces] = useState([]);
@@ -9,10 +12,9 @@ export default function App() {
   const [selectedPod, setSelectedPod] = useState("");
   const [tail, setTail] = useState(200);
   const [logs, setLogs] = useState("");
-  const [loadingPods, setLoadingPods] = useState(false);
   const [loadingNamespaces, setLoadingNamespaces] = useState(true);
   const [loadingLogs, setLoadingLogs] = useState(false);
-  const [loadingMetrics, setLoadingMetrics] = useState(false);
+  const [logsPollingEnabled, setLogsPollingEnabled] = useState(true);
   const [error, setError] = useState("");
   const [metricsSource, setMetricsSource] = useState("");
 
@@ -20,6 +22,58 @@ export default function App() {
     () => pods.find((pod) => pod.name === selectedPod),
     [pods, selectedPod]
   );
+  const runningPods = useMemo(
+    () => pods.filter((pod) => pod.phase === "Running").length,
+    [pods]
+  );
+  const degradedPods = useMemo(
+    () =>
+      pods.filter(
+        (pod) =>
+          pod.phase !== "Running" ||
+          Number(pod.restarts || 0) > 0
+      ).length,
+    [pods]
+  );
+  const hotMetrics = useMemo(
+    () => metrics.filter((metric) => Number(metric.cpuCores || 0) >= 0.15).length,
+    [metrics]
+  );
+  const metricsByPod = useMemo(() => {
+    const map = new Map();
+    metrics.forEach((metric) => {
+      const podName = metric.pod || "unknown";
+      const cpuCores = Number(metric.cpuCores || 0);
+      const memoryMiB = Number(metric.memoryMiB || 0);
+      const current = map.get(podName) || { cpuCores: 0, memoryMiB: 0, containers: 0 };
+      current.cpuCores += cpuCores;
+      current.memoryMiB += memoryMiB;
+      current.containers += 1;
+      map.set(podName, current);
+    });
+    return map;
+  }, [metrics]);
+  const podsWithMetrics = useMemo(
+    () =>
+      pods.map((pod) => {
+        const podMetrics = metricsByPod.get(pod.name);
+        return {
+          ...pod,
+          cpuCores: podMetrics ? podMetrics.cpuCores.toFixed(4) : null,
+          memoryMiB: podMetrics ? podMetrics.memoryMiB.toFixed(2) : null
+        };
+      }),
+    [pods, metricsByPod]
+  );
+  const metricsEmptyMessage = useMemo(() => {
+    if (pods.length === 0) {
+      return "No pods found in this namespace yet. Start a simulator or choose another namespace.";
+    }
+    if (runningPods === 0) {
+      return "Pods exist, but none are Running yet. Metrics appear after pods enter Running state.";
+    }
+    return "No metrics returned yet for currently running pods. Wait a few seconds for the next update cycle.";
+  }, [pods.length, runningPods]);
 
   async function loadNamespaces() {
     setLoadingNamespaces(true);
@@ -28,7 +82,9 @@ export default function App() {
       const data = await fetchNamespaces();
       const nextNamespaces = data.namespaces || [];
       setNamespaces(nextNamespaces);
-      if (nextNamespaces.length && !nextNamespaces.includes(namespace)) {
+      if (nextNamespaces.includes("simulation") && namespace !== "simulation") {
+        setNamespace("simulation");
+      } else if (nextNamespaces.length && !nextNamespaces.includes(namespace)) {
         setNamespace(nextNamespaces[0]);
       }
     } catch (err) {
@@ -39,8 +95,6 @@ export default function App() {
   }
 
   async function refreshPods() {
-    setLoadingPods(true);
-    setError("");
     try {
       const data = await fetchPods(namespace);
       setPods(data.pods || []);
@@ -51,14 +105,10 @@ export default function App() {
       }
     } catch (err) {
       setError(err.message);
-    } finally {
-      setLoadingPods(false);
     }
   }
 
   async function refreshMetrics() {
-    setLoadingMetrics(true);
-    setError("");
     try {
       const data = await fetchPodMetrics(namespace);
       setMetrics(data.metrics || []);
@@ -67,15 +117,16 @@ export default function App() {
       setMetrics([]);
       setError(err.message || "Metrics request failed.");
       setMetricsSource("unavailable");
-    } finally {
-      setLoadingMetrics(false);
     }
   }
 
-  async function refreshLogs() {
+  async function refreshLogs(options = {}) {
+    const { showLoading = true } = options;
     if (!selectedPod) return;
-    setLoadingLogs(true);
-    setError("");
+    if (showLoading) {
+      setLoadingLogs(true);
+      setError("");
+    }
     try {
       const container = selectedPodObj?.containers?.[0] || "";
       const data = await fetchLogs({
@@ -88,59 +139,106 @@ export default function App() {
     } catch (err) {
       setError(err.message);
     } finally {
-      setLoadingLogs(false);
+      if (showLoading) {
+        setLoadingLogs(false);
+      }
     }
   }
 
   useEffect(() => {
     loadNamespaces();
+    return undefined;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    refreshPods();
-    refreshMetrics();
+    if (!namespace) return undefined;
+    let mounted = true;
+    async function tick() {
+      if (!mounted) return;
+      await Promise.all([refreshPods(), refreshMetrics()]);
+    }
+    tick();
+    const intervalId = setInterval(tick, PODS_AND_METRICS_POLL_MS);
+    return () => {
+      mounted = false;
+      clearInterval(intervalId);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [namespace]);
 
+  useEffect(() => {
+    if (!namespace || !selectedPod || !logsPollingEnabled) return undefined;
+    let mounted = true;
+    async function tick() {
+      if (!mounted) return;
+      await refreshLogs({ showLoading: false });
+    }
+    tick();
+    const intervalId = setInterval(tick, LOGS_POLL_MS);
+    return () => {
+      mounted = false;
+      clearInterval(intervalId);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [namespace, selectedPod, tail, logsPollingEnabled]);
+
   return (
     <div className="page">
-      <header>
-        <h1>Local Kubernetes Pod Health</h1>
-        <p>Inspect running pods, fetch fresh logs, and review basic metrics.</p>
+      <header className="hero">
+        <h1>Kubernetes Incident Console</h1>
       </header>
 
-      <section className="controls">
-        <label>
-          Namespace:
-          <select
-            value={namespace}
-            onChange={(e) => setNamespace(e.target.value)}
-            disabled={loadingNamespaces || namespaces.length === 0}
-          >
-            {loadingNamespaces && <option value={namespace}>Loading namespaces...</option>}
-            {!loadingNamespaces && namespaces.length === 0 && (
-              <option value="">No namespaces available</option>
-            )}
-            {namespaces.map((item) => (
-              <option key={item} value={item}>
-                {item}
-              </option>
-            ))}
-          </select>
-        </label>
-        <button onClick={refreshPods} disabled={loadingPods}>
-          {loadingPods ? "Refreshing pods..." : "Refresh Pods"}
-        </button>
-        <button onClick={refreshMetrics} disabled={loadingMetrics}>
-          {loadingMetrics ? "Refreshing metrics..." : "Refresh Metrics"}
-        </button>
+      <section className="card controls-panel">
+        <div className="controls-row">
+          <label className="control-label">
+            Namespace
+            <select
+              value={namespace}
+              onChange={(e) => setNamespace(e.target.value)}
+              disabled={loadingNamespaces || namespaces.length === 0}
+            >
+              {loadingNamespaces && <option value={namespace}>Loading namespaces...</option>}
+              {!loadingNamespaces && namespaces.length === 0 && (
+                <option value="">No namespaces available</option>
+              )}
+              {namespaces.map((item) => (
+                <option key={item} value={item}>
+                  {item}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <div className="summary-row">
+          <div className="summary-tile">
+            <span className="summary-label">Namespace</span>
+            <span className="summary-value">{namespace || "n/a"}</span>
+          </div>
+          <div className="summary-tile">
+            <span className="summary-label">Pods Running</span>
+            <span className="summary-value">{runningPods}</span>
+          </div>
+          <div className="summary-tile">
+            <span className="summary-label">Needs Attention</span>
+            <span className="summary-value">{degradedPods}</span>
+          </div>
+          <div className="summary-tile">
+            <span className="summary-label">High CPU Containers</span>
+            <span className="summary-value">{hotMetrics}</span>
+          </div>
+        </div>
       </section>
 
       {error && <p className="error">{error}</p>}
 
-      <section>
-        <h2>Pods</h2>
+      <section className="card">
+        <h2>Pods + Metrics</h2>
+        {metricsSource && (
+          <p className="muted">
+            Source: <strong>{metricsSource}</strong>
+          </p>
+        )}
         <table>
           <thead>
             <tr>
@@ -149,36 +247,52 @@ export default function App() {
               <th>Restarts</th>
               <th>Age</th>
               <th>Node</th>
+              <th>CPU (cores)</th>
+              <th>Memory (MiB)</th>
             </tr>
           </thead>
           <tbody>
-            {pods.map((pod) => (
-              <tr
-                key={pod.name}
-                onClick={() => setSelectedPod(pod.name)}
-                className={selectedPod === pod.name ? "selected" : ""}
-              >
-                <td>{pod.name}</td>
-                <td>{pod.phase}</td>
-                <td>{pod.restarts}</td>
-                <td>{pod.age}</td>
-                <td>{pod.nodeName}</td>
-              </tr>
-            ))}
+            {podsWithMetrics.map((pod) => {
+              const highCpu = Number(pod.cpuCores || 0) >= 0.15;
+              const warn = pod.phase !== "Running" || Number(pod.restarts || 0) > 0 || highCpu;
+              return (
+                <tr
+                  key={pod.name}
+                  onClick={() => setSelectedPod(pod.name)}
+                  className={`${selectedPod === pod.name ? "selected" : ""} ${warn ? "warn-row" : ""}`}
+                >
+                  <td>{pod.name}</td>
+                  <td>
+                    <span className={`phase-chip phase-${String(pod.phase || "").toLowerCase()}`}>
+                      {pod.phase}
+                    </span>
+                  </td>
+                  <td>{pod.restarts}</td>
+                  <td>{pod.age}</td>
+                  <td>{pod.nodeName}</td>
+                  <td>{pod.cpuCores ?? "n/a"}</td>
+                  <td>{pod.memoryMiB ?? "n/a"}</td>
+                </tr>
+              );
+            })}
             {pods.length === 0 && (
               <tr>
-                <td colSpan="5">No pods found.</td>
+                <td colSpan="7">No pods found.</td>
               </tr>
             )}
           </tbody>
         </table>
+        {metrics.length === 0 && <p className="muted">{metricsEmptyMessage}</p>}
       </section>
 
-      <section>
+      <section className="card">
         <h2>Logs</h2>
-        <div className="controls">
-          <label>
-            Pod:
+        <p className="muted">
+          Polling: <strong>{logsPollingEnabled ? `on (${LOGS_POLL_MS / 1000}s)` : "stopped"}</strong>
+        </p>
+        <div className="controls-row">
+          <label className="control-label">
+            Pod
             <select value={selectedPod} onChange={(e) => setSelectedPod(e.target.value)}>
               {pods.map((pod) => (
                 <option key={pod.name} value={pod.name}>
@@ -187,8 +301,8 @@ export default function App() {
               ))}
             </select>
           </label>
-          <label>
-            Tail lines:
+          <label className="control-label">
+            Tail lines
             <input
               type="number"
               min="10"
@@ -197,44 +311,23 @@ export default function App() {
               onChange={(e) => setTail(Number(e.target.value))}
             />
           </label>
-          <button onClick={refreshLogs} disabled={loadingLogs || !selectedPod}>
+          <button
+            onClick={async () => {
+              setLogsPollingEnabled(true);
+              await refreshLogs();
+            }}
+            disabled={loadingLogs || !selectedPod}
+          >
             {loadingLogs ? "Fetching logs..." : "Refresh Logs"}
           </button>
+          <button
+            onClick={() => setLogsPollingEnabled(false)}
+            disabled={!logsPollingEnabled || !selectedPod}
+          >
+            Stop Logs
+          </button>
         </div>
-        <pre>{logs || "Select a pod and click Refresh Logs."}</pre>
-      </section>
-
-      <section>
-        <h2>Pod Metrics (metrics-server)</h2>
-        {metricsSource && (
-          <p>
-            Source: <strong>{metricsSource}</strong>
-          </p>
-        )}
-        {metrics.length === 0 ? (
-          <p>No real metrics available yet. Ensure metrics-server is healthy.</p>
-        ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>Pod</th>
-                <th>Container</th>
-                <th>CPU (cores)</th>
-                <th>Memory (MiB)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {metrics.map((metric) => (
-                <tr key={`${metric.pod}-${metric.container}`}>
-                  <td>{metric.pod}</td>
-                  <td>{metric.container}</td>
-                  <td>{metric.cpuCores}</td>
-                  <td>{metric.memoryMiB}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
+        <pre>{logs || "Select a pod to stream log output."}</pre>
       </section>
     </div>
   );

@@ -100,3 +100,29 @@ cd /Users/anushasg/www
 ```
 
 The script does not build an image or deploy the application backend to Kubernetes. The backend runs locally on port `8080` and accesses the cluster through your active kubeconfig.
+
+## Simulation Scenarios
+
+The repository includes a scripted failure-simulation environment defined in `simulate.md` and implemented by `scripts/simulate.sh`.
+
+Install simulation resources (idle by default, all replicas `0`):
+
+```bash
+cd /Users/anushasg/www
+./scripts/simulate.sh install
+```
+
+Start, inspect, fix, and reset a scenario:
+
+```bash
+./scripts/simulate.sh start crashloop
+./scripts/simulate.sh status crashloop
+./scripts/simulate.sh fix crashloop
+./scripts/simulate.sh reset crashloop
+```
+
+Reset all running scenarios:
+
+```bash
+./scripts/simulate.sh reset all
+```

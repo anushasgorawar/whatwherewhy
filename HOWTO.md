@@ -123,8 +123,98 @@ cd /Users/anushasg/www
 
 What the script does:
 - Verifies access to the current Kubernetes cluster.
+- If `kube-system/metrics-server` exists and is missing `--kubelet-insecure-tls`, patches the deployment and waits for rollout.
 - Checks whether the Kubernetes Metrics API is available and prints a warning if it is not.
 - Opens Terminal tab 1 for frontend dev server (`frontend`: `npm install && npm run dev`).
 - Opens Terminal tab 2 for backend local dev server (`backend`: `npm install && npm run dev`).
 
 No application image is built, no application pod is deployed, and no port-forward is needed. The local backend uses the active kubeconfig to retrieve pod lists, pod logs, and real CPU/memory data from `metrics.k8s.io`.
+
+Manual equivalent for the metrics-server patch (if you are not using `start-dev-stack.sh`):
+
+```bash
+kubectl -n kube-system patch deployment metrics-server --type='json' -p='[
+  {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}
+]'
+kubectl -n kube-system rollout status deploy/metrics-server
+```
+
+### Live frontend behavior
+
+After the latest frontend update, data auto-refreshes while the UI is open:
+
+- namespaces on explicit **Refresh Namespaces** button click
+- pods and metrics every 5s
+- logs every 5s for the selected pod
+
+If you made code changes or pulled updates, restart frontend/backend:
+
+```bash
+cd /Users/anushasg/www/frontend
+npm run dev
+```
+
+```bash
+cd /Users/anushasg/www/backend
+npm run dev
+```
+
+## 11) Simulation environment commands
+
+Install simulation resources (all six deployments at `replicas=0`):
+
+```bash
+cd /Users/anushasg/www
+./scripts/simulate.sh install
+```
+
+Start one scenario (this scales the selected simulator to `1` and all others to `0`):
+
+```bash
+./scripts/simulate.sh start crashloop
+```
+
+Check scenario status:
+
+```bash
+./scripts/simulate.sh status crashloop
+```
+
+Trigger interactive auth failure:
+
+```bash
+./scripts/simulate.sh trigger auth
+```
+
+Apply scenario fix:
+
+```bash
+./scripts/simulate.sh fix crashloop
+./scripts/simulate.sh fix auth
+./scripts/simulate.sh fix cpu
+./scripts/simulate.sh fix memory
+./scripts/simulate.sh fix readiness
+./scripts/simulate.sh fix config
+```
+
+Reset one scenario or all scenarios:
+
+```bash
+./scripts/simulate.sh reset cpu
+./scripts/simulate.sh reset all
+```
+
+Cleanup simulation namespace:
+
+```bash
+./scripts/simulate.sh cleanup
+```
+
+Direct kubectl inspection:
+
+```bash
+kubectl -n simulation get deployments,pods
+kubectl -n simulation get events --sort-by=.lastTimestamp
+kubectl -n simulation logs deployment/crashloop-simulator --tail=200
+kubectl top pods -n simulation
+```

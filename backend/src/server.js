@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const morgan = require("morgan");
+const path = require("path");
 const { z } = require("zod");
 const { PassThrough } = require("stream");
 const { fetchPodMetricsFromMetricsServer } = require("./metrics-server");
@@ -12,6 +13,7 @@ const port = process.env.PORT || 8080;
 app.use(cors());
 app.use(express.json());
 app.use(morgan("combined"));
+app.use("/assets/fonts", express.static(path.resolve(__dirname, "../exwayer")));
 
 const namespaceSchema = z.object({
   namespace: z.string().min(1).max(63).default("default")

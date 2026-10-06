@@ -1,0 +1,322 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crashloop-simulator
+  namespace: simulation
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: crashloop-simulator
+  template:
+    metadata:
+      labels:
+        app: crashloop-simulator
+    spec:
+      containers:
+        - name: simulator
+          image: python:3.11-alpine
+          command: ["python", "/opt/sim/simulator.py"]
+          env:
+            - name: SERVICE_NAME
+              value: crashloop-simulator
+            - name: SCENARIO
+              value: crashloop
+            - name: FAIL_MODE
+              value: "true"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+          volumeMounts:
+            - name: scripts
+              mountPath: /opt/sim
+      volumes:
+        - name: scripts
+          configMap:
+            name: simulator-scripts
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-simulator
+  namespace: simulation
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: auth-simulator
+  template:
+    metadata:
+      labels:
+        app: auth-simulator
+    spec:
+      containers:
+        - name: simulator
+          image: python:3.11-alpine
+          command: ["python", "/opt/sim/simulator.py"]
+          env:
+            - name: SERVICE_NAME
+              value: auth-simulator
+            - name: SCENARIO
+              value: auth
+            - name: AUTH_VALID_USER
+              value: demo-user
+            - name: AUTH_VALID_PASS
+              value: demo-pass
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+          volumeMounts:
+            - name: scripts
+              mountPath: /opt/sim
+      volumes:
+        - name: scripts
+          configMap:
+            name: simulator-scripts
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-simulator
+  namespace: simulation
+spec:
+  selector:
+    app: auth-simulator
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cpu-simulator
+  namespace: simulation
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: cpu-simulator
+  template:
+    metadata:
+      labels:
+        app: cpu-simulator
+    spec:
+      containers:
+        - name: simulator
+          image: python:3.11-alpine
+          command: ["python", "/opt/sim/simulator.py"]
+          env:
+            - name: SERVICE_NAME
+              value: cpu-simulator
+            - name: SCENARIO
+              value: cpu
+            - name: CPU_SATURATION
+              value: "true"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "300m"
+              memory: "128Mi"
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+          volumeMounts:
+            - name: scripts
+              mountPath: /opt/sim
+      volumes:
+        - name: scripts
+          configMap:
+            name: simulator-scripts
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memory-simulator
+  namespace: simulation
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: memory-simulator
+  template:
+    metadata:
+      labels:
+        app: memory-simulator
+    spec:
+      containers:
+        - name: simulator
+          image: python:3.11-alpine
+          command: ["python", "/opt/sim/simulator.py"]
+          env:
+            - name: SERVICE_NAME
+              value: memory-simulator
+            - name: SCENARIO
+              value: memory
+            - name: MEM_TARGET_MB
+              value: "256"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+          volumeMounts:
+            - name: scripts
+              mountPath: /opt/sim
+      volumes:
+        - name: scripts
+          configMap:
+            name: simulator-scripts
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: readiness-simulator
+  namespace: simulation
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: readiness-simulator
+  template:
+    metadata:
+      labels:
+        app: readiness-simulator
+    spec:
+      containers:
+        - name: simulator
+          image: python:3.11-alpine
+          command: ["python", "/opt/sim/simulator.py"]
+          env:
+            - name: SERVICE_NAME
+              value: readiness-simulator
+            - name: SCENARIO
+              value: readiness
+            - name: READINESS_FAIL
+              value: "true"
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+          volumeMounts:
+            - name: scripts
+              mountPath: /opt/sim
+      volumes:
+        - name: scripts
+          configMap:
+            name: simulator-scripts
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: readiness-simulator
+  namespace: simulation
+spec:
+  selector:
+    app: readiness-simulator
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-simulator-settings
+  namespace: simulation
+data:
+  APP_MODE: broken
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: config-simulator
+  namespace: simulation
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: config-simulator
+  template:
+    metadata:
+      labels:
+        app: config-simulator
+    spec:
+      containers:
+        - name: simulator
+          image: python:3.11-alpine
+          command: ["python", "/opt/sim/simulator.py"]
+          env:
+            - name: SERVICE_NAME
+              value: config-simulator
+            - name: SCENARIO
+              value: config
+            - name: CONFIG_MODE
+              valueFrom:
+                configMapKeyRef:
+                  name: config-simulator-settings
+                  key: APP_MODE
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+          volumeMounts:
+            - name: scripts
+              mountPath: /opt/sim
+      volumes:
+        - name: scripts
+          configMap:
+            name: simulator-scripts
