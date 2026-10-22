@@ -7,6 +7,12 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MANIFEST_DIR="${ROOT_DIR}/k8s/simulation"
 
 SCENARIOS=(crashloop auth cpu memory readiness config)
+HEALTHY_BASELINE_DEPLOYMENTS=(
+  "healthy-baseline-api"
+  "healthy-baseline-worker"
+  "healthy-baseline-cache"
+  "healthy-baseline-gateway"
+)
 
 deployment_for() {
   case "$1" in
@@ -45,10 +51,16 @@ reset_defaults() {
 }
 
 scale_all_zero() {
-  for scenario in "${SCENARIOS[@]}"; do
+  for item in "${SCENARIOS[@]}"; do
     local dep
-    dep="$(deployment_for "${scenario}")"
+    dep="$(deployment_for "${item}")"
     kubectl -n "${NAMESPACE}" scale deployment/"${dep}" --replicas=0 >/dev/null
+  done
+}
+
+scale_healthy_baseline() {
+  for dep in "${HEALTHY_BASELINE_DEPLOYMENTS[@]}"; do
+    kubectl -n "${NAMESPACE}" scale deployment/"${dep}" --replicas=1 >/dev/null
   done
 }
 
@@ -56,7 +68,8 @@ cmd_install() {
   kubectl apply -k "${MANIFEST_DIR}"
   scale_all_zero
   reset_defaults
-  echo "Simulation resources installed in namespace '${NAMESPACE}' with all deployments at replicas=0."
+  scale_healthy_baseline
+  echo "Simulation resources installed in namespace '${NAMESPACE}'. Four healthy baseline pods are running (replicas=1 each); all scenario simulators are replicas=0."
 }
 
 cmd_start() {
@@ -67,8 +80,9 @@ cmd_start() {
 
   scale_all_zero
   reset_defaults
-  kubectl -n "${NAMESPACE}" scale deployment/"${target_dep}" --replicas=1
-  echo "Started scenario '${scenario}' (${target_dep}). All other simulators are scaled to 0."
+  scale_healthy_baseline
+  kubectl -n "${NAMESPACE}" scale deployment/"${target_dep}" --replicas=1 >/dev/null
+  echo "Started scenario '${scenario}' (${target_dep}) with healthy baseline '${HEALTHY_BASELINE_DEPLOYMENT}' also running."
 }
 
 cmd_status() {
@@ -148,7 +162,8 @@ cmd_reset() {
   if [[ "${scenario}" == "all" ]]; then
     scale_all_zero
     reset_defaults
-    echo "Reset all scenarios to replicas=0 and default failure settings."
+    scale_healthy_baseline
+    echo "Reset all scenarios to default failure settings and restored all healthy baseline pods (replicas=1 each)."
     return
   fi
   require_scenario "${scenario}"

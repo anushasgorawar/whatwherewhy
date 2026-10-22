@@ -24,8 +24,23 @@ Open: `http://localhost:5173`
 ```bash
 cd /Users/anushasg/www/backend
 npm install
+cp .env.example .env
+# edit .env and set:
+# - OPENAI_API_KEY (preferred; used when present), or
+# - GEMINI_API_KEY (used when OPENAI_API_KEY is absent)
+# optional model variables:
+# - OPENAI_MODEL (default: gpt-4o-mini)
+# - GEMINI_MODEL (default: gemini-1.5-flash)
 npm start
 ```
+
+`backend/.env` is git-ignored. Keep secrets there instead of exporting them in shell history.
+
+LLM provider selection behavior:
+- If `OPENAI_API_KEY` is set, backend uses OpenAI for Inspect.
+- Else if `GEMINI_API_KEY` is set, backend uses Gemini.
+- If both are missing, Inspect returns a configuration error.
+- For Gemini, if the configured model returns 404, backend automatically tries a small fallback list (`gemini-1.5-flash`, `gemini-1.5-pro`, `gemini-2.0-flash`).
 
 Backend health:
 
@@ -159,20 +174,86 @@ cd /Users/anushasg/www/backend
 npm run dev
 ```
 
+### AI inspect/execute API quick checks
+
+Inspect current namespace/pod evidence with AI:
+
+```bash
+curl -X POST http://localhost:8080/api/ai/inspect \
+  -H "Content-Type: application/json" \
+  -d '{
+    "namespace":"simulation",
+    "selectedPod":"cpu-simulator-548d4c57fb-tvb5m",
+    "tail":200
+  }'
+```
+
+Note: Inspect now sends a compact payload to the LLM by default: selected-pod metrics plus the last 20 log lines, to reduce model timeout risk.
+
+Namespace resource dashboard API (all namespaces total + per-namespace CPU/memory):
+
+```bash
+curl http://localhost:8080/api/metrics/namespaces-summary
+```
+
+Re-inspect with "Find Another Way" feedback:
+
+```bash
+curl -X POST http://localhost:8080/api/ai/inspect \
+  -H "Content-Type: application/json" \
+  -d '{
+    "namespace":"simulation",
+    "selectedPod":"cpu-simulator-548d4c57fb-tvb5m",
+    "priorAttempt":{
+      "previousReason":"Previous suggestion did not resolve issue",
+      "previousCommands":["kubectl rollout restart deployment/cpu-simulator -n simulation"],
+      "feedback":"the prev solution did not work, suggest more ideas"
+    }
+  }'
+```
+
+Execute approved AI commands (allowlist + namespace-scoped only):
+
+```bash
+curl -X POST http://localhost:8080/api/ai/execute \
+  -H "Content-Type: application/json" \
+  -d '{
+    "namespace":"simulation",
+    "commands":[
+      {
+        "id":"cmd-1",
+        "command":"kubectl scale deployment/cpu-simulator --replicas=2 -n simulation"
+      }
+    ]
+  }'
+```
+
 ## 11) Simulation environment commands
 
-Install simulation resources (all six deployments at `replicas=0`):
+Install simulation resources (healthy baseline starts automatically):
 
 ```bash
 cd /Users/anushasg/www
 ./scripts/simulate.sh install
 ```
 
+Default post-install state:
+- `healthy-baseline-api` running at `replicas=1`
+- `healthy-baseline-worker` running at `replicas=1`
+- `healthy-baseline-cache` running at `replicas=1`
+- `healthy-baseline-gateway` running at `replicas=1`
+- all other simulators at `replicas=0`
+
 Start one scenario (this scales the selected simulator to `1` and all others to `0`):
 
 ```bash
 ./scripts/simulate.sh start crashloop
 ```
+
+Current behavior:
+- all four healthy baseline pods remain running at `replicas=1`
+- selected scenario also runs at `replicas=1`
+- all other simulators remain at `replicas=0`
 
 Check scenario status:
 
@@ -203,6 +284,8 @@ Reset one scenario or all scenarios:
 ./scripts/simulate.sh reset cpu
 ./scripts/simulate.sh reset all
 ```
+
+`reset all` restores the same four healthy baseline pods (`replicas=1` each) and keeps all scenarios at `0`.
 
 Cleanup simulation namespace:
 
