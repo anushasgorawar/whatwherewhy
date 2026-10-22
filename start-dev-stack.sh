@@ -20,6 +20,17 @@ require_cmd npm
 echo "Checking Kubernetes access..."
 kubectl cluster-info >/dev/null
 
+if kubectl -n kube-system get deployment metrics-server >/dev/null 2>&1; then
+  METRICS_SERVER_ARGS="$(kubectl -n kube-system get deployment metrics-server -o jsonpath='{.spec.template.spec.containers[0].args}')"
+  if [[ "${METRICS_SERVER_ARGS}" != *"--kubelet-insecure-tls"* ]]; then
+    echo "Patching metrics-server: adding --kubelet-insecure-tls for local-cluster scraping compatibility..."
+    kubectl -n kube-system patch deployment metrics-server --type='json' -p='[
+      {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}
+    ]' >/dev/null
+    kubectl -n kube-system rollout status deployment/metrics-server --timeout=120s >/dev/null || true
+  fi
+fi
+
 if ! kubectl get --raw "/apis/metrics.k8s.io/v1beta1/nodes" >/dev/null 2>&1; then
   echo "Warning: Kubernetes metrics API is unavailable; pod logs will work, but CPU/memory metrics will not."
 fi

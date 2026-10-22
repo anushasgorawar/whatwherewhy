@@ -1,0 +1,187 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: simulator-scripts
+  namespace: simulation
+data:
+  simulator.py: |
+    import json
+    import os
+    import signal
+    import sys
+    import threading
+    import time
+    from datetime import datetime, timezone
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+    def now_utc():
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+    def log(severity, event, message, extra=None):
+        payload = {
+            "timestamp": now_utc(),
+            "service": os.getenv("SERVICE_NAME", "unknown-simulator"),
+            "severity": severity,
+            "event": event,
+            "message": message,
+        }
+        if extra:
+            payload.update(extra)
+        print(json.dumps(payload), flush=True)
+
+
+    class SimulatorHandler(BaseHTTPRequestHandler):
+        def _write_json(self, code, payload):
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _fmt, *_args):
+            return
+
+        def do_GET(self):
+            if self.path == "/health":
+                self._write_json(200, {"ok": True})
+                return
+            if self.path == "/ready":
+                readiness_fail = os.getenv("READINESS_FAIL", "false").lower() == "true"
+                if readiness_fail:
+                    log("WARN", "READINESS_REJECTED", "Readiness probe rejected")
+                    self._write_json(503, {"ready": False})
+                else:
+                    self._write_json(200, {"ready": True})
+                return
+            self._write_json(404, {"error": "not found"})
+
+        def do_POST(self):
+            if self.path != "/login":
+                self._write_json(404, {"error": "not found"})
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except Exception:
+                payload = {}
+
+            username = payload.get("username", "")
+            valid_user = os.getenv("AUTH_VALID_USER", "demo-user")
+            valid_pass = os.getenv("AUTH_VALID_PASS", "demo-pass")
+            password = payload.get("password", "")
+            ok = username == valid_user and password == valid_pass
+            if ok:
+                log("INFO", "AUTH_SUCCESS", "Synthetic login accepted", {
+                    "username": username,
+                    "status": 200
+                })
+                self._write_json(200, {"authenticated": True})
+            else:
+                log("WARN", "AUTH_INVALID_CREDENTIALS", "Synthetic login rejected", {
+                    "username": username,
+                    "status": 401,
+                    "reason": "invalid credentials"
+                })
+                self._write_json(401, {"authenticated": False})
+
+
+    def run_http_server():
+        server = HTTPServer(("0.0.0.0", 8080), SimulatorHandler)
+        log("INFO", "HTTP_SERVER_STARTED", "Simulator HTTP server started", {"port": 8080})
+        server.serve_forever()
+
+
+    def run_crashloop():
+        fail_mode = os.getenv("FAIL_MODE", "true").lower() == "true"
+        if fail_mode:
+            log("ERROR", "STARTUP_FATAL", "Fatal startup condition simulated")
+            sys.exit(1)
+        log("INFO", "RECOVERED", "Crashloop simulator healthy mode enabled")
+        while True:
+            time.sleep(10)
+            log("INFO", "HEARTBEAT", "Crashloop simulator healthy heartbeat")
+
+
+    def run_cpu():
+        saturation = os.getenv("CPU_SATURATION", "true").lower() == "true"
+        if saturation:
+            log("WARN", "CPU_SATURATION", "CPU saturation loop active")
+            while True:
+                _ = 0
+                for i in range(50000):
+                    _ += i * i
+                if int(time.time()) % 10 == 0:
+                    log("WARN", "CPU_SATURATION", "CPU saturation still active")
+        else:
+            log("INFO", "CPU_NORMAL", "CPU simulator in normal mode")
+            while True:
+                time.sleep(10)
+                log("INFO", "HEARTBEAT", "CPU simulator normal heartbeat")
+
+
+    def run_memory():
+        target_mb = int(os.getenv("MEM_TARGET_MB", "256"))
+        chunk_mb = 8
+        allocated = []
+        log("WARN", "MEMORY_ALLOCATION_START", "Memory allocation simulation started", {"targetMB": target_mb})
+        for i in range(0, target_mb, chunk_mb):
+            allocated.append(bytearray(chunk_mb * 1024 * 1024))
+            log("WARN", "MEMORY_ALLOCATING", "Allocating memory", {"allocatedMB": i + chunk_mb})
+            time.sleep(0.4)
+        while True:
+            time.sleep(10)
+            log("INFO", "HEARTBEAT", "Memory simulator alive", {"allocatedMB": target_mb})
+
+
+    def run_config():
+        mode = os.getenv("CONFIG_MODE", "broken")
+        if mode == "broken":
+            log("ERROR", "CONFIG_INVALID", "Unsupported operating mode", {"configuredValue": mode})
+            sys.exit(1)
+        log("INFO", "CONFIG_VALID", "Configuration accepted", {"configuredValue": mode})
+        while True:
+            time.sleep(10)
+            log("INFO", "HEARTBEAT", "Config simulator healthy heartbeat")
+
+
+    def run_http_scenario():
+        thread = threading.Thread(target=run_http_server, daemon=True)
+        thread.start()
+        while True:
+            time.sleep(30)
+            log("INFO", "HEARTBEAT", "HTTP simulator heartbeat")
+
+
+    def main():
+        scenario = os.getenv("SCENARIO", "")
+        service = os.getenv("SERVICE_NAME", "unknown-simulator")
+        log("INFO", "SIMULATOR_START", "Starting simulator", {"scenario": scenario, "service": service})
+        if scenario == "crashloop":
+            run_crashloop()
+        elif scenario == "cpu":
+            run_cpu()
+        elif scenario == "memory":
+            run_memory()
+        elif scenario == "config":
+            run_config()
+        elif scenario == "auth":
+            run_http_scenario()
+        elif scenario == "readiness":
+            run_http_scenario()
+        else:
+            log("ERROR", "SCENARIO_INVALID", "Unknown scenario", {"scenario": scenario})
+            sys.exit(1)
+
+
+    if __name__ == "__main__":
+        def handle_signal(_sig, _frame):
+            log("INFO", "SIMULATOR_STOP", "Simulator received stop signal")
+            sys.exit(0)
+
+        signal.signal(signal.SIGTERM, handle_signal)
+        signal.signal(signal.SIGINT, handle_signal)
+        main()
