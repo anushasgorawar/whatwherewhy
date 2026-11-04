@@ -82,7 +82,7 @@ cmd_start() {
   reset_defaults
   scale_healthy_baseline
   kubectl -n "${NAMESPACE}" scale deployment/"${target_dep}" --replicas=1 >/dev/null
-  echo "Started scenario '${scenario}' (${target_dep}) with healthy baseline '${HEALTHY_BASELINE_DEPLOYMENT}' also running."
+  echo "Started scenario '${scenario}' (${target_dep}) with healthy baseline deployments also running."
 }
 
 cmd_status() {

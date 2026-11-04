@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   Bot,
@@ -14,7 +14,6 @@ import {
   HardDrive,
   Loader2,
   Logs,
-  MoonStar,
   PlayCircle,
   ShieldCheck,
   UserCircle2
@@ -22,6 +21,8 @@ import {
 import { Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import {
   executeAISuggestion,
+  fetchClusterStatus,
+  fetchDashboardSummary,
   fetchLogs,
   fetchNamespaceMetricsSummary,
   fetchNamespaces,
@@ -60,7 +61,7 @@ export default function App() {
   const [selectedPod, setSelectedPod] = useState("");
   const [expandedPod, setExpandedPod] = useState("");
   const [activeTab, setActiveTab] = useState("metrics");
-  const [tail, setTail] = useState(200);
+  const [tail, setTail] = useState(20);
   const [logs, setLogs] = useState("");
   const [activeLogPod, setActiveLogPod] = useState("");
   const [logsPollingEnabled, setLogsPollingEnabled] = useState(false);
@@ -69,19 +70,28 @@ export default function App() {
   const [loadingData, setLoadingData] = useState(false);
   const [error, setError] = useState("");
   const [metricsSource, setMetricsSource] = useState("");
+  const [clusterConnected, setClusterConnected] = useState(false);
+  const [clusterStatusCheckedAt, setClusterStatusCheckedAt] = useState("");
+  const [dashboardSummary, setDashboardSummary] = useState({
+    runningPods: null,
+    needsAttentionPods: null,
+    needsAttentionPodNames: [],
+    highCpuContainers: null,
+    highCpuPodNames: [],
+    highCpuThresholdCores: null
+  });
+  const [podFilter, setPodFilter] = useState("all");
   const [namespaceMenuOpen, setNamespaceMenuOpen] = useState(false);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiExecuting, setAiExecuting] = useState(false);
   const [aiResult, setAiResult] = useState(null);
   const [aiExecutionResult, setAiExecutionResult] = useState(null);
+  const [showAiInsight, setShowAiInsight] = useState(false);
+  const [aiInsightExpanded, setAiInsightExpanded] = useState(true);
+  const [aiDegradedMessage, setAiDegradedMessage] = useState("");
   const [metricHistory, setMetricHistory] = useState([]);
   const namespaceDropdownRef = useRef(null);
 
-  const runningPods = useMemo(() => pods.filter((pod) => pod.phase === "Running").length, [pods]);
-  const degradedPods = useMemo(
-    () => pods.filter((pod) => pod.phase !== "Running" || Number(pod.restarts || 0) > 0).length,
-    [pods]
-  );
   const metricsByPod = useMemo(() => {
     const map = new Map();
     metrics.forEach((metric) => {
@@ -113,11 +123,22 @@ export default function App() {
     () => podsWithMetrics.find((pod) => pod.name === (expandedPod || selectedPod)),
     [podsWithMetrics, expandedPod, selectedPod]
   );
-
-  const hotMetrics = useMemo(
-    () => metrics.filter((metric) => Number(metric.cpuCores || 0) >= 0.15).length,
-    [metrics]
+  const expandedPodRow = useMemo(
+    () => podsWithMetrics.find((pod) => pod.name === expandedPod),
+    [podsWithMetrics, expandedPod]
   );
+
+  const displayedPods = useMemo(() => {
+    if (podFilter === "needs-attention") {
+      const set = new Set(dashboardSummary.needsAttentionPodNames || []);
+      return podsWithMetrics.filter((pod) => set.has(pod.name));
+    }
+    if (podFilter === "high-cpu") {
+      const set = new Set(dashboardSummary.highCpuPodNames || []);
+      return podsWithMetrics.filter((pod) => set.has(pod.name));
+    }
+    return podsWithMetrics;
+  }, [podFilter, dashboardSummary.needsAttentionPodNames, dashboardSummary.highCpuPodNames, podsWithMetrics]);
 
   const namespaceCpuTotal = useMemo(
     () => metrics.reduce((sum, metric) => sum + Number(metric.cpuCores || 0), 0).toFixed(4),
@@ -128,18 +149,6 @@ export default function App() {
     () => metrics.reduce((sum, metric) => sum + Number(metric.memoryMiB || 0), 0).toFixed(2),
     [metrics]
   );
-
-  const currentClusterMetrics = useMemo(
-    () => namespaceSummary.find((item) => item.namespace === namespace),
-    [namespaceSummary, namespace]
-  );
-
-  const aiConfidence = useMemo(() => {
-    if (!aiResult) return 0;
-    if (aiResult.risk_level === "low") return 84;
-    if (aiResult.risk_level === "medium") return 63;
-    return 42;
-  }, [aiResult]);
 
   const aiSteps = useMemo(
     () => [
@@ -201,10 +210,47 @@ export default function App() {
       const nextPods = podData.pods || [];
       setPods(nextPods);
       setMetrics(metricData.metrics || []);
-      setMetricsSource(metricData.source || "metrics-server");
+      setMetricsSource(metricData.source || "unknown");
       setNamespaceSummary(nsSummaryData.namespaces || []);
       setGlobalCpuTotal(nsSummaryData.totalCpuCores || "0.0000");
       setGlobalMemoryTotal(nsSummaryData.totalMemoryMiB || "0.00");
+
+      try {
+        const summaryData = await fetchDashboardSummary(namespace);
+        setDashboardSummary({
+          runningPods: Number(summaryData.runningPods || 0),
+          needsAttentionPods: Number(summaryData.needsAttentionPods || 0),
+          needsAttentionPodNames: summaryData.needsAttentionPodNames || [],
+          highCpuContainers:
+            summaryData.highCpuContainers === null || summaryData.highCpuContainers === undefined
+              ? null
+              : Number(summaryData.highCpuContainers),
+          highCpuPodNames: summaryData.highCpuPodNames || [],
+          highCpuThresholdCores:
+            summaryData.highCpuThresholdCores === null || summaryData.highCpuThresholdCores === undefined
+              ? null
+              : Number(summaryData.highCpuThresholdCores)
+        });
+      } catch (_summaryErr) {
+        setDashboardSummary({
+          runningPods: null,
+          needsAttentionPods: null,
+          needsAttentionPodNames: [],
+          highCpuContainers: null,
+          highCpuPodNames: [],
+          highCpuThresholdCores: null
+        });
+        setPodFilter("all");
+      }
+
+      try {
+        const clusterStatusData = await fetchClusterStatus();
+        setClusterConnected(Boolean(clusterStatusData.connected));
+        setClusterStatusCheckedAt(clusterStatusData.checkedAt || "");
+      } catch (_clusterErr) {
+        setClusterConnected(false);
+        setClusterStatusCheckedAt(new Date().toISOString());
+      }
 
       if (nextPods.length && !nextPods.some((pod) => pod.name === selectedPod)) {
         setSelectedPod(nextPods[0].name);
@@ -244,20 +290,29 @@ export default function App() {
     }
   }
 
-  async function runInspect(priorAttempt) {
-    if (!selectedPod) return;
+  async function runInspect(priorAttempt, podOverride) {
+    const targetPod = podOverride || selectedPod;
+    if (!targetPod) return;
     setAiLoading(true);
     setAiExecutionResult(null);
     setError("");
     try {
       const result = await inspectWithAI({
         namespace,
-        selectedPod,
+        selectedPod: targetPod,
         tail,
         priorAttempt
       });
       setAiResult(result);
+      if (result?.degraded_mode) {
+        setAiDegradedMessage(
+          "AI degraded mode: provider is temporarily unavailable. Showing safe diagnostics while you continue investigation."
+        );
+      } else {
+        setAiDegradedMessage("");
+      }
     } catch (err) {
+      setAiDegradedMessage("");
       setError(err.message || "AI inspect failed.");
     } finally {
       setAiLoading(false);
@@ -290,6 +345,10 @@ export default function App() {
     loadNamespaces();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    setPodFilter("all");
+  }, [namespace]);
 
   useEffect(() => {
     if (!namespace) return undefined;
@@ -348,29 +407,24 @@ export default function App() {
               <Boxes className="h-5 w-5 text-[#0969F9]" />
             </div>
             <div>
-              <h1 className="text-xl font-semibold tracking-tight text-[#0F172A]">On Call</h1>
-              <p className="text-sm text-[#64748B]">See what needs fixing</p>
+              <h1 className="text-xl font-semibold tracking-tight text-[#0F172A]">Monitoring Dashboard</h1>
             </div>
           </div>
           <div className="flex items-center gap-3">
-            <div className="flex items-center gap-2 rounded-full border border-[#DCFCE7] bg-[#F0FDF4] px-3 py-1 text-sm text-[#166534]">
-              <span className="h-2 w-2 rounded-full bg-[#16A34A]" />
-              Connected to cluster
-            </div>
-            {loadingAny ? (
-              <div className="flex items-center gap-2 text-sm text-[#64748B]">
-                <Loader2 className="h-4 w-4 animate-spin text-[#0969F9]" />
-                Syncing
+            {clusterConnected ? (
+              <div className="flex items-center gap-2 rounded-full border border-[#DCFCE7] bg-[#F0FDF4] px-3 py-1 text-sm text-[#166534]">
+                <span className="h-2 w-2 rounded-full bg-[#16A34A]" />
+                Connected to cluster
               </div>
             ) : (
-              <div className="flex items-center gap-2 text-sm text-[#64748B]">
-                <ShieldCheck className="h-4 w-4 text-[#16A34A]" />
-                Live
+              <div className="flex items-center gap-2 rounded-full border border-[#FECACA] bg-[#FEF2F2] px-3 py-1 text-sm text-[#991B1B]">
+                <span className="h-2 w-2 rounded-full bg-[#EF4444]" />
+                Cluster unavailable
               </div>
             )}
-            <button className="rounded-btn border border-[#E2E8F0] bg-white p-2 text-[#64748B]">
-              <MoonStar className="h-4 w-4" />
-            </button>
+            <div className="text-xs text-[#64748B]">
+              Last Synced: {clusterStatusCheckedAt ? new Date(clusterStatusCheckedAt).toLocaleTimeString() : "n/a"}
+            </div>
             <div className="flex h-9 w-9 items-center justify-center rounded-full border border-[#E2E8F0] bg-[#F8FAFC] text-[#0969F9]">
               <UserCircle2 className="h-5 w-5" />
             </div>
@@ -382,8 +436,17 @@ export default function App() {
             {error}
           </div>
         )}
+        {aiDegradedMessage && (
+          <div className="mb-4 rounded-btn border border-[#FDE68A] bg-[#FFFBEB] px-3 py-2 text-sm text-[#92400E]">
+            {aiDegradedMessage}
+          </div>
+        )}
 
-        <div className="grid grid-cols-1 gap-4 xl:[grid-template-columns:minmax(0,74%)_minmax(320px,26%)]">
+        <div
+          className={`grid grid-cols-1 gap-4 ${
+            showAiInsight ? "xl:[grid-template-columns:minmax(0,74%)_minmax(320px,26%)]" : ""
+          }`}
+        >
           <main className="space-y-4">
             <section className="rounded-card border border-[#E2E8F0] bg-white p-4 shadow-soft">
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -418,18 +481,50 @@ export default function App() {
                     )}
                   </div>
                 </div>
-                <div className="rounded-nested border border-[#BBF7D0] bg-[#F0FDF4] p-3">
+                <button
+                  className={`rounded-nested border border-[#BBF7D0] bg-[#F0FDF4] p-3 text-left ${
+                    podFilter === "all" ? "ring-2 ring-[#16A34A]" : ""
+                  }`}
+                  onClick={() => setPodFilter("all")}
+                >
                   <p className="text-xs font-medium uppercase tracking-wide text-[#64748B]">Pods Running</p>
-                  <p className="mt-2 text-2xl font-semibold text-[#0F172A]">{runningPods}</p>
-                </div>
-                <div className="rounded-nested border border-[#FDE68A] bg-[#FFFBEB] p-3">
+                  <p className="mt-2 text-2xl font-semibold text-[#0F172A]">
+                    {dashboardSummary.runningPods === null ? "n/a" : dashboardSummary.runningPods}
+                  </p>
+                </button>
+                <button
+                  className={`rounded-nested border border-[#FDE68A] bg-[#FFFBEB] p-3 text-left ${
+                    podFilter === "needs-attention" ? "ring-2 ring-[#F59E0B]" : ""
+                  }`}
+                  onClick={() =>
+                    setPodFilter((prev) => (prev === "needs-attention" ? "all" : "needs-attention"))
+                  }
+                >
                   <p className="text-xs font-medium uppercase tracking-wide text-[#64748B]">Needs Attention</p>
-                  <p className="mt-2 text-2xl font-semibold text-[#0F172A]">{degradedPods}</p>
-                </div>
-                <div className="rounded-nested border border-[#FECACA] bg-[#FEF2F2] p-3">
+                  <p className="mt-2 text-2xl font-semibold text-[#0F172A]">
+                    {dashboardSummary.needsAttentionPods === null ? "n/a" : dashboardSummary.needsAttentionPods}
+                  </p>
+                </button>
+                <button
+                  className={`rounded-nested border border-[#FECACA] bg-[#FEF2F2] p-3 text-left ${
+                    podFilter === "high-cpu" ? "ring-2 ring-[#EF4444]" : ""
+                  } ${dashboardSummary.highCpuContainers === null ? "opacity-70" : ""}`}
+                  onClick={() => {
+                    if (dashboardSummary.highCpuContainers === null) return;
+                    setPodFilter((prev) => (prev === "high-cpu" ? "all" : "high-cpu"));
+                  }}
+                  disabled={dashboardSummary.highCpuContainers === null}
+                >
                   <p className="text-xs font-medium uppercase tracking-wide text-[#64748B]">High CPU Containers</p>
-                  <p className="mt-2 text-2xl font-semibold text-[#0F172A]">{hotMetrics}</p>
-                </div>
+                  <p className="mt-2 text-2xl font-semibold text-[#0F172A]">
+                    {dashboardSummary.highCpuContainers === null ? "n/a" : dashboardSummary.highCpuContainers}
+                  </p>
+                  <p className="mt-1 text-xs text-[#64748B]">
+                    {dashboardSummary.highCpuThresholdCores === null
+                      ? "Set CPU_ALERT_CORES in backend/.env"
+                      : `>= ${dashboardSummary.highCpuThresholdCores} cores`}
+                  </p>
+                </button>
               </div>
             </section>
 
@@ -497,7 +592,7 @@ export default function App() {
                 <h2 className="text-base font-semibold text-[#0F172A]">Pods</h2>
                 <div className="flex items-center gap-2 text-xs text-[#64748B]">
                   <Clock3 className="h-4 w-4" />
-                  Source: <span className="font-medium text-[#0F172A]">{metricsSource || "metrics-server"}</span>
+                  Source: <span className="font-medium text-[#0F172A]">{metricsSource || "unknown"}</span>
                 </div>
               </div>
               <div className="overflow-hidden rounded-nested border border-[#E2E8F0]">
@@ -514,57 +609,222 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#E2E8F0] bg-white">
-                    {podsWithMetrics.map((pod) => {
+                    {displayedPods.map((pod) => {
                       const isRunning = pod.phase === "Running";
                       const isExpanded = expandedPod === pod.name;
                       return (
-                        <tr key={pod.name} className={`text-[#0F172A] ${isExpanded ? "bg-[#F8FAFC]" : "bg-white"}`}>
-                          <td className="px-3 py-2 font-medium">{pod.name}</td>
-                          <td className="px-3 py-2">
-                            <span
-                              className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
-                                isRunning
-                                  ? "bg-[#ECFDF3] text-[#16A34A]"
-                                  : "bg-[#FEF3C7] text-[#B45309]"
-                              }`}
-                            >
-                              {pod.phase}
-                            </span>
-                          </td>
-                          <td className="px-3 py-2">{pod.cpuCores} cores</td>
-                          <td className="px-3 py-2">{formatBytesMiBToHuman(pod.memoryMiB)}</td>
-                          <td className="px-3 py-2">{pod.restarts}</td>
-                          <td className="px-3 py-2">
-                            <button
-                              className="rounded-btn border border-[#BFDBFE] bg-[#EFF6FF] px-2 py-1 text-xs font-medium text-[#1D4ED8] disabled:opacity-60"
-                              disabled={aiLoading}
-                              onClick={() => {
-                                setSelectedPod(pod.name);
-                                runInspect();
-                              }}
-                            >
-                              {aiLoading && selectedPod === pod.name ? "Inspecting..." : "Inspect"}
-                            </button>
-                          </td>
-                          <td className="px-3 py-2">
-                            <button
-                              className="inline-flex items-center gap-1 rounded-btn border border-[#E2E8F0] bg-white px-2 py-1 text-xs text-[#334155]"
-                              onClick={() => {
-                                setSelectedPod(pod.name);
-                                setExpandedPod(isExpanded ? "" : pod.name);
-                                if (!isExpanded) setActiveTab("metrics");
-                              }}
-                            >
-                              More {isExpanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
-                            </button>
-                          </td>
-                        </tr>
+                        <Fragment key={pod.name}>
+                          <tr className={`text-[#0F172A] ${isExpanded ? "bg-[#F8FAFC]" : "bg-white"}`}>
+                            <td className="px-3 py-2 font-medium">{pod.name}</td>
+                            <td className="px-3 py-2">
+                              <span
+                                className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
+                                  isRunning
+                                    ? "bg-[#ECFDF3] text-[#16A34A]"
+                                    : "bg-[#FEF3C7] text-[#B45309]"
+                                }`}
+                              >
+                                {pod.phase}
+                              </span>
+                            </td>
+                            <td className="px-3 py-2">{pod.cpuCores} cores</td>
+                            <td className="px-3 py-2">{formatBytesMiBToHuman(pod.memoryMiB)}</td>
+                            <td className="px-3 py-2">{pod.restarts}</td>
+                            <td className="px-3 py-2">
+                              <button
+                                type="button"
+                                className="rounded-btn border border-[#BFDBFE] bg-[#EFF6FF] px-2 py-1 text-xs font-medium text-[#1D4ED8] disabled:opacity-60"
+                                disabled={aiLoading}
+                                onClick={() => {
+                                  setSelectedPod(pod.name);
+                                  setShowAiInsight(true);
+                                  setAiInsightExpanded(true);
+                                  runInspect(undefined, pod.name);
+                                }}
+                              >
+                                {aiLoading && selectedPod === pod.name ? "Inspecting..." : "Inspect"}
+                              </button>
+                            </td>
+                            <td className="px-3 py-2">
+                              <button
+                                type="button"
+                                className="inline-flex items-center gap-1 rounded-btn border border-[#E2E8F0] bg-white px-2 py-1 text-xs text-[#334155]"
+                                onClick={() => {
+                                  setSelectedPod(pod.name);
+                                  setExpandedPod((prev) => {
+                                    const next = prev === pod.name ? "" : pod.name;
+                                    if (next) setActiveTab("metrics");
+                                    return next;
+                                  });
+                                }}
+                              >
+                                More {isExpanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                              </button>
+                            </td>
+                          </tr>
+                          {isExpanded && (expandedPodRow || selectedPodRow) && (
+                            <tr className="bg-white">
+                              <td colSpan={7} className="p-3">
+                                <div className="rounded-nested border border-[#E2E8F0] bg-white p-4">
+                                  <div className="mb-3 flex gap-4 border-b border-[#E2E8F0]">
+                                    {[
+                                      { id: "metrics", label: "Metrics", icon: Activity },
+                                      { id: "logs", label: "Logs", icon: Logs },
+                                      { id: "yaml", label: "YAML", icon: FileCode2 },
+                                      { id: "events", label: "Events", icon: Clock3 }
+                                    ].map((tab) => {
+                                      const Icon = tab.icon;
+                                      const active = activeTab === tab.id;
+                                      return (
+                                        <button
+                                          key={tab.id}
+                                          className={`inline-flex items-center gap-1 border-b-2 px-1 py-2 text-sm ${
+                                            active
+                                              ? "border-[#0969F9] text-[#0969F9]"
+                                              : "border-transparent text-[#64748B]"
+                                          }`}
+                                          onClick={() => setActiveTab(tab.id)}
+                                        >
+                                          <Icon className="h-4 w-4" />
+                                          {tab.label}
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+
+                                  {activeTab === "metrics" && (
+                                    <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+                                      <div className="rounded-nested border border-[#E2E8F0] bg-white p-3">
+                                        <p className="mb-2 text-sm font-medium text-[#64748B]">CPU Usage History</p>
+                                        <div className="h-56">
+                                          <ResponsiveContainer width="100%" height="100%">
+                                            <LineChart data={metricHistory}>
+                                              <XAxis dataKey="time" tick={{ fontSize: 11, fill: "#64748B" }} />
+                                              <YAxis tick={{ fontSize: 11, fill: "#64748B" }} />
+                                              <Tooltip />
+                                              <Line type="monotone" dataKey="cpu" stroke="#0969F9" strokeWidth={2} dot={false} />
+                                            </LineChart>
+                                          </ResponsiveContainer>
+                                        </div>
+                                      </div>
+                                      <div className="rounded-nested border border-[#E2E8F0] bg-white p-3">
+                                        <p className="mb-2 text-sm font-medium text-[#64748B]">Memory Usage History</p>
+                                        <div className="h-56">
+                                          <ResponsiveContainer width="100%" height="100%">
+                                            <LineChart data={metricHistory}>
+                                              <XAxis dataKey="time" tick={{ fontSize: 11, fill: "#64748B" }} />
+                                              <YAxis tick={{ fontSize: 11, fill: "#64748B" }} />
+                                              <Tooltip />
+                                              <Line type="monotone" dataKey="memory" stroke="#7C3AED" strokeWidth={2} dot={false} />
+                                            </LineChart>
+                                          </ResponsiveContainer>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {activeTab === "logs" && (
+                                    <div className="space-y-3">
+                                      <div className="flex flex-wrap items-end gap-3">
+                                        <label className="text-sm text-[#64748B]">
+                                          Tail lines
+                                          <input
+                                            className="mt-1 block rounded-btn border border-[#E2E8F0] bg-white px-2 py-1 text-sm text-[#0F172A]"
+                                            type="number"
+                                            min="10"
+                                            max="1000"
+                                            value={tail}
+                                            onChange={(e) => setTail(Number(e.target.value))}
+                                          />
+                                        </label>
+                                        <button
+                                          className="rounded-btn bg-[#0969F9] px-3 py-2 text-sm font-medium text-white disabled:opacity-60"
+                                          disabled={loadingLogs}
+                                          onClick={async () => {
+                                            setActiveLogPod(expandedPod);
+                                            setLogsPollingEnabled(true);
+                                            await refreshLogsForPod(expandedPod, true);
+                                          }}
+                                        >
+                                          {loadingLogs ? "Refreshing..." : "Refresh Logs"}
+                                        </button>
+                                        <button
+                                          className="rounded-btn border border-[#E2E8F0] bg-white px-3 py-2 text-sm text-[#334155] disabled:opacity-60"
+                                          disabled={!logsPollingEnabled}
+                                          onClick={() => setLogsPollingEnabled(false)}
+                                        >
+                                          Stop Logs
+                                        </button>
+                                        <button
+                                          className="rounded-btn border border-[#BFDBFE] bg-[#EFF6FF] px-3 py-2 text-sm text-[#1D4ED8] disabled:opacity-60"
+                                          disabled={aiLoading}
+                                          onClick={() => {
+                                            setShowAiInsight(true);
+                                            setAiInsightExpanded(true);
+                                            runInspect();
+                                          }}
+                                        >
+                                          {aiLoading ? "Inspecting..." : "Inspect"}
+                                        </button>
+                                      </div>
+                                      <div className="rounded-nested border border-[#1E293B] bg-[#17202D] p-3">
+                                        <pre className="log-scrollbar max-h-72 overflow-auto whitespace-pre-wrap font-mono text-xs leading-relaxed text-[#E2E8F0]">
+                                          {(activeLogPod === expandedPod ? logs : "Click Refresh Logs to load output.")
+                                            .split("\n")
+                                            .map((line, idx) => {
+                                              const kind = classifyLogLine(line);
+                                              const color =
+                                                kind === "error"
+                                                  ? "text-[#EF4444]"
+                                                  : kind === "warn"
+                                                    ? "text-[#F59E0B]"
+                                                    : "text-[#38BDF8]";
+                                              return (
+                                                <span key={`${line}-${idx}`} className={line ? color : "text-[#94A3B8]"}>
+                                                  {line || " "}
+                                                  {"\n"}
+                                                </span>
+                                              );
+                                            })}
+                                        </pre>
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {activeTab === "yaml" && (
+                                    <div className="rounded-nested border border-[#E2E8F0] bg-[#0F172A] p-3">
+                                      <pre className="max-h-72 overflow-auto whitespace-pre-wrap font-mono text-xs text-[#E2E8F0]">
+                                        {JSON.stringify(expandedPodRow || selectedPodRow, null, 2)}
+                                      </pre>
+                                    </div>
+                                  )}
+
+                                  {activeTab === "events" && (
+                                    <div className="space-y-2">
+                                      {podEvents.map((event, index) => (
+                                        <div
+                                          key={`${event}-${index}`}
+                                          className="flex items-start gap-2 rounded-nested border border-[#E2E8F0] bg-[#F8FAFC] p-3 text-sm text-[#334155]"
+                                        >
+                                          <Clock3 className="mt-0.5 h-4 w-4 text-[#0969F9]" />
+                                          {event}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </Fragment>
                       );
                     })}
-                    {podsWithMetrics.length === 0 && (
+                    {displayedPods.length === 0 && (
                       <tr>
                         <td className="px-3 py-5 text-center text-[#64748B]" colSpan={7}>
-                          No pods found in this namespace.
+                          {podFilter === "all"
+                            ? "No pods found in this namespace."
+                            : "No pods match the current filter."}
                         </td>
                       </tr>
                     )}
@@ -572,268 +832,138 @@ export default function App() {
                 </table>
               </div>
 
-              {expandedPod && selectedPodRow && (
-                <div className="mt-4 rounded-nested border border-[#E2E8F0] bg-white p-4">
-                  <div className="mb-3 flex gap-4 border-b border-[#E2E8F0]">
-                    {[
-                      { id: "metrics", label: "Metrics", icon: Activity },
-                      { id: "logs", label: "Logs", icon: Logs },
-                      { id: "yaml", label: "YAML", icon: FileCode2 },
-                      { id: "events", label: "Events", icon: Clock3 }
-                    ].map((tab) => {
-                      const Icon = tab.icon;
-                      const active = activeTab === tab.id;
-                      return (
-                        <button
-                          key={tab.id}
-                          className={`inline-flex items-center gap-1 border-b-2 px-1 py-2 text-sm ${
-                            active
-                              ? "border-[#0969F9] text-[#0969F9]"
-                              : "border-transparent text-[#64748B]"
-                          }`}
-                          onClick={() => setActiveTab(tab.id)}
-                        >
-                          <Icon className="h-4 w-4" />
-                          {tab.label}
-                        </button>
-                      );
-                    })}
-                  </div>
-
-                  {activeTab === "metrics" && (
-                    <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-                      <div className="rounded-nested border border-[#E2E8F0] bg-white p-3">
-                        <p className="mb-2 text-sm font-medium text-[#64748B]">CPU Usage History</p>
-                        <div className="h-56">
-                          <ResponsiveContainer width="100%" height="100%">
-                            <LineChart data={metricHistory}>
-                              <XAxis dataKey="time" tick={{ fontSize: 11, fill: "#64748B" }} />
-                              <YAxis tick={{ fontSize: 11, fill: "#64748B" }} />
-                              <Tooltip />
-                              <Line type="monotone" dataKey="cpu" stroke="#0969F9" strokeWidth={2} dot={false} />
-                            </LineChart>
-                          </ResponsiveContainer>
-                        </div>
-                      </div>
-                      <div className="rounded-nested border border-[#E2E8F0] bg-white p-3">
-                        <p className="mb-2 text-sm font-medium text-[#64748B]">Memory Usage History</p>
-                        <div className="h-56">
-                          <ResponsiveContainer width="100%" height="100%">
-                            <LineChart data={metricHistory}>
-                              <XAxis dataKey="time" tick={{ fontSize: 11, fill: "#64748B" }} />
-                              <YAxis tick={{ fontSize: 11, fill: "#64748B" }} />
-                              <Tooltip />
-                              <Line type="monotone" dataKey="memory" stroke="#7C3AED" strokeWidth={2} dot={false} />
-                            </LineChart>
-                          </ResponsiveContainer>
-                        </div>
-                      </div>
-                    </div>
-                  )}
-
-                  {activeTab === "logs" && (
-                    <div className="space-y-3">
-                      <div className="flex flex-wrap items-end gap-3">
-                        <label className="text-sm text-[#64748B]">
-                          Tail lines
-                          <input
-                            className="mt-1 block rounded-btn border border-[#E2E8F0] bg-white px-2 py-1 text-sm text-[#0F172A]"
-                            type="number"
-                            min="10"
-                            max="1000"
-                            value={tail}
-                            onChange={(e) => setTail(Number(e.target.value))}
-                          />
-                        </label>
-                        <button
-                          className="rounded-btn bg-[#0969F9] px-3 py-2 text-sm font-medium text-white disabled:opacity-60"
-                          disabled={loadingLogs}
-                          onClick={async () => {
-                            setActiveLogPod(expandedPod);
-                            setLogsPollingEnabled(true);
-                            await refreshLogsForPod(expandedPod, true);
-                          }}
-                        >
-                          {loadingLogs ? "Refreshing..." : "Refresh Logs"}
-                        </button>
-                        <button
-                          className="rounded-btn border border-[#E2E8F0] bg-white px-3 py-2 text-sm text-[#334155] disabled:opacity-60"
-                          disabled={!logsPollingEnabled}
-                          onClick={() => setLogsPollingEnabled(false)}
-                        >
-                          Stop Logs
-                        </button>
-                        <button
-                          className="rounded-btn border border-[#BFDBFE] bg-[#EFF6FF] px-3 py-2 text-sm text-[#1D4ED8] disabled:opacity-60"
-                          disabled={aiLoading}
-                          onClick={() => runInspect()}
-                        >
-                          {aiLoading ? "Inspecting..." : "Inspect"}
-                        </button>
-                      </div>
-                      <div className="rounded-nested border border-[#1E293B] bg-[#17202D] p-3">
-                        <pre className="log-scrollbar max-h-72 overflow-auto whitespace-pre-wrap font-mono text-xs leading-relaxed text-[#E2E8F0]">
-                          {(activeLogPod === expandedPod ? logs : "Click Refresh Logs to load output.")
-                            .split("\n")
-                            .map((line, idx) => {
-                              const kind = classifyLogLine(line);
-                              const color =
-                                kind === "error"
-                                  ? "text-[#EF4444]"
-                                  : kind === "warn"
-                                    ? "text-[#F59E0B]"
-                                    : "text-[#38BDF8]";
-                              return (
-                                <span key={`${line}-${idx}`} className={line ? color : "text-[#94A3B8]"}>
-                                  {line || " "}
-                                  {"\n"}
-                                </span>
-                              );
-                            })}
-                        </pre>
-                      </div>
-                    </div>
-                  )}
-
-                  {activeTab === "yaml" && (
-                    <div className="rounded-nested border border-[#E2E8F0] bg-[#0F172A] p-3">
-                      <pre className="max-h-72 overflow-auto whitespace-pre-wrap font-mono text-xs text-[#E2E8F0]">
-                        {JSON.stringify(selectedPodRow, null, 2)}
-                      </pre>
-                    </div>
-                  )}
-
-                  {activeTab === "events" && (
-                    <div className="space-y-2">
-                      {podEvents.map((event, index) => (
-                        <div
-                          key={`${event}-${index}`}
-                          className="flex items-start gap-2 rounded-nested border border-[#E2E8F0] bg-[#F8FAFC] p-3 text-sm text-[#334155]"
-                        >
-                          <Clock3 className="mt-0.5 h-4 w-4 text-[#0969F9]" />
-                          {event}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
             </section>
           </main>
 
-          <aside className="space-y-4">
-            <section className="rounded-card border border-[#E9D5FF] bg-[#FCFAFF] p-4 shadow-soft">
-              <div className="mb-3 flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Bot className="h-5 w-5 text-[#7C3AED]" />
-                  <h2 className="text-base font-semibold text-[#0F172A]">AI Insight</h2>
-                </div>
-                <span className="rounded-full bg-[#F3E8FF] px-2 py-0.5 text-xs font-medium text-[#7C3AED]">Beta</span>
-              </div>
-              <p className="mb-4 text-sm text-[#64748B]">
-                AI-assisted investigation summarizes live pod evidence and proposes safe next actions.
-              </p>
-
-              <div className="mb-4">
-                <h3 className="mb-2 text-sm font-semibold text-[#0F172A]">Investigation Progress</h3>
-                <div className="space-y-2">
-                  {aiSteps.map((step) => (
-                    <div key={step.id} className="flex items-center gap-2 text-sm">
-                      {step.state === "done" && <CheckCircle2 className="h-4 w-4 text-[#16A34A]" />}
-                      {step.state === "active" && <Loader2 className="h-4 w-4 animate-spin text-[#0969F9]" />}
-                      {step.state === "upcoming" && <Circle className="h-4 w-4 text-[#94A3B8]" />}
-                      <span className="text-[#334155]">{step.label}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              <div className="mb-4 rounded-nested border border-[#E2E8F0] bg-[#F8FAFC] p-3">
-                <h3 className="mb-2 text-sm font-semibold text-[#0F172A]">Key Evidence</h3>
-                <ul className="space-y-1 text-sm text-[#475569]">
-                  {(aiResult?.details || ["Run Investigate to collect evidence."]).slice(0, 3).map((item) => (
-                    <li key={item} className="flex items-start gap-2">
-                      <Eye className="mt-0.5 h-4 w-4 text-[#64748B]" />
-                      <span>{item}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-
-              <div
-                className={`mb-4 rounded-nested border p-3 text-sm ${
-                  aiResult?.risk_level === "high"
-                    ? "border-[#FECACA] bg-[#FEF2F2] text-[#991B1B]"
-                    : aiResult?.risk_level === "medium"
-                      ? "border-[#FDE68A] bg-[#FFFBEB] text-[#92400E]"
-                      : "border-[#DCFCE7] bg-[#F0FDF4] text-[#166534]"
-                }`}
-              >
-                <h3 className="mb-1 font-semibold">Likely Root Cause</h3>
-                <p>{aiResult?.one_liner_reason || "No active diagnosis yet."}</p>
-              </div>
-
-              <div className="mb-4">
-                <div className="mb-2 flex items-center justify-between text-sm">
-                  <h3 className="font-semibold text-[#0F172A]">Confidence</h3>
-                  <span className="text-[#64748B]">{aiConfidence}%</span>
-                </div>
-                <div className="h-2 w-full rounded-full bg-[#E2E8F0]">
-                  <div className="h-2 rounded-full bg-[#0969F9]" style={{ width: `${aiConfidence}%` }} />
-                </div>
-              </div>
-
-              <div>
-                <h3 className="mb-2 text-sm font-semibold text-[#0F172A]">Proposed Action</h3>
-                <div className="grid grid-cols-1 gap-2">
+          {showAiInsight && (
+            <aside className="space-y-4">
+              <section className="rounded-card border border-[#E9D5FF] bg-[#FCFAFF] p-4 shadow-soft">
+                <div className="mb-3 flex items-center justify-between">
                   <button
-                    className="inline-flex items-center justify-center gap-2 rounded-btn bg-[#0969F9] px-3 py-2 text-sm font-medium text-white disabled:opacity-60"
-                    disabled={aiLoading || !selectedPod}
-                    onClick={() => runInspect()}
+                    className="inline-flex items-center gap-2 rounded-btn border border-transparent px-1 py-1 text-left"
+                    onClick={() => setAiInsightExpanded((prev) => !prev)}
                   >
-                    {aiLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlayCircle className="h-4 w-4" />}
-                    Investigate
+                    <Bot className="h-5 w-5 text-[#7C3AED]" />
+                    <h2 className="text-base font-semibold text-[#0F172A]">AI Insight</h2>
+                    {aiInsightExpanded ? (
+                      <ChevronUp className="h-4 w-4 text-[#64748B]" />
+                    ) : (
+                      <ChevronDown className="h-4 w-4 text-[#64748B]" />
+                    )}
                   </button>
-                  <button
-                    className="inline-flex items-center justify-center gap-2 rounded-btn border border-[#E2E8F0] bg-white px-3 py-2 text-sm font-medium text-[#0F172A] disabled:opacity-60"
-                    disabled={aiExecuting || !aiResult?.commands?.length}
-                    onClick={runFixIt}
-                  >
-                    {aiExecuting ? <Loader2 className="h-4 w-4 animate-spin text-[#0969F9]" /> : <ShieldCheck className="h-4 w-4 text-[#16A34A]" />}
-                    Approve
-                  </button>
-                  <button
-                    className="inline-flex items-center justify-center gap-2 rounded-btn border border-[#E2E8F0] bg-white px-3 py-2 text-sm font-medium text-[#0F172A] disabled:opacity-60"
-                    disabled={!selectedPod}
-                    onClick={() => {
-                      setExpandedPod(selectedPod);
-                      setActiveTab("logs");
-                    }}
-                  >
-                    <Logs className="h-4 w-4 text-[#64748B]" />
-                    View Logs
-                  </button>
-                </div>
-              </div>
-
-              {aiExecutionResult?.results?.length > 0 && (
-                <div className="mt-4 rounded-nested border border-[#E2E8F0] bg-[#F8FAFC] p-3">
-                  <h3 className="mb-2 text-sm font-semibold text-[#0F172A]">Execution Feedback</h3>
-                  <div className="space-y-2 text-xs text-[#334155]">
-                    {aiExecutionResult.results.map((r) => (
-                      <div key={`${r.id}-${r.command}`} className="rounded-btn border border-[#E2E8F0] bg-white p-2">
-                        <p className="mb-1 font-medium">
-                          {r.status} - {r.command}
-                        </p>
-                        {r.reason && <p className="text-[#B45309]">{r.reason}</p>}
-                        {r.stderr && <p className="font-mono text-[#EF4444]">{r.stderr}</p>}
-                      </div>
-                    ))}
+                  <div className="flex items-center gap-2">
+                    <button
+                      className="rounded-btn border border-[#E2E8F0] bg-white px-2 py-0.5 text-xs text-[#64748B]"
+                      onClick={() => setShowAiInsight(false)}
+                    >
+                      Close
+                    </button>
                   </div>
                 </div>
-              )}
-            </section>
-          </aside>
+
+                {aiInsightExpanded && (
+                  <>
+                    <p className="mb-4 text-sm text-[#64748B]">
+                      AI-assisted investigation summarizes live pod evidence and proposes safe next actions.
+                    </p>
+
+                    <div className="mb-4">
+                      <h3 className="mb-2 text-sm font-semibold text-[#0F172A]">Investigation Progress</h3>
+                      <div className="space-y-2">
+                        {aiSteps.map((step) => (
+                          <div key={step.id} className="flex items-center gap-2 text-sm">
+                            {step.state === "done" && <CheckCircle2 className="h-4 w-4 text-[#16A34A]" />}
+                            {step.state === "active" && <Loader2 className="h-4 w-4 animate-spin text-[#0969F9]" />}
+                            {step.state === "upcoming" && <Circle className="h-4 w-4 text-[#94A3B8]" />}
+                            <span className="text-[#334155]">{step.label}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="mb-4 rounded-nested border border-[#E2E8F0] bg-[#F8FAFC] p-3">
+                      <h3 className="mb-2 text-sm font-semibold text-[#0F172A]">Key Evidence</h3>
+                      <ul className="space-y-1 text-sm text-[#475569]">
+                        {(aiResult?.details?.length ? aiResult.details : ["No evidence summary available."])
+                          .slice(0, 3)
+                          .map((item) => (
+                          <li key={item} className="flex items-start gap-2">
+                            <Eye className="mt-0.5 h-4 w-4 text-[#64748B]" />
+                            <span>{item}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+
+                    <div
+                      className={`mb-4 rounded-nested border p-3 text-sm ${
+                        !aiResult
+                          ? "border-[#E2E8F0] bg-[#F8FAFC] text-[#334155]"
+                          : aiResult.risk_level === "high"
+                          ? "border-[#FECACA] bg-[#FEF2F2] text-[#991B1B]"
+                          : aiResult.risk_level === "medium"
+                            ? "border-[#FDE68A] bg-[#FFFBEB] text-[#92400E]"
+                            : "border-[#DCFCE7] bg-[#F0FDF4] text-[#166534]"
+                      }`}
+                    >
+                      <h3 className="mb-1 font-semibold">Likely Root Cause</h3>
+                      <p>{aiResult?.one_liner_reason || "Diagnosis not available yet."}</p>
+                    </div>
+
+                    <div>
+                      <h3 className="mb-2 text-sm font-semibold text-[#0F172A]">Proposed Action</h3>
+                      <div className="grid grid-cols-1 gap-2">
+                        <button
+                          className="inline-flex items-center justify-center gap-2 rounded-btn bg-[#0969F9] px-3 py-2 text-sm font-medium text-white disabled:opacity-60"
+                          disabled={aiLoading || !selectedPod}
+                          onClick={() => runInspect()}
+                        >
+                          {aiLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlayCircle className="h-4 w-4" />}
+                          Investigate
+                        </button>
+                        <button
+                          className="inline-flex items-center justify-center gap-2 rounded-btn border border-[#E2E8F0] bg-white px-3 py-2 text-sm font-medium text-[#0F172A] disabled:opacity-60"
+                          disabled={aiExecuting || !aiResult?.commands?.length}
+                          onClick={runFixIt}
+                        >
+                          {aiExecuting ? <Loader2 className="h-4 w-4 animate-spin text-[#0969F9]" /> : <ShieldCheck className="h-4 w-4 text-[#16A34A]" />}
+                          Approve
+                        </button>
+                        <button
+                          className="inline-flex items-center justify-center gap-2 rounded-btn border border-[#E2E8F0] bg-white px-3 py-2 text-sm font-medium text-[#0F172A] disabled:opacity-60"
+                          disabled={!selectedPod}
+                          onClick={() => {
+                            setExpandedPod(selectedPod);
+                            setActiveTab("logs");
+                          }}
+                        >
+                          <Logs className="h-4 w-4 text-[#64748B]" />
+                          View Logs
+                        </button>
+                      </div>
+                    </div>
+
+                    {aiExecutionResult?.results?.length > 0 && (
+                      <div className="mt-4 rounded-nested border border-[#E2E8F0] bg-[#F8FAFC] p-3">
+                        <h3 className="mb-2 text-sm font-semibold text-[#0F172A]">Execution Feedback</h3>
+                        <div className="space-y-2 text-xs text-[#334155]">
+                          {aiExecutionResult.results.map((r) => (
+                            <div key={`${r.id}-${r.command}`} className="rounded-btn border border-[#E2E8F0] bg-white p-2">
+                              <p className="mb-1 font-medium">
+                                {r.status} - {r.command}
+                              </p>
+                              {r.reason && <p className="text-[#B45309]">{r.reason}</p>}
+                              {r.stderr && <p className="font-mono text-[#EF4444]">{r.stderr}</p>}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+              </section>
+            </aside>
+          )}
         </div>
       </div>
     </div>

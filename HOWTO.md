@@ -31,6 +31,10 @@ cp .env.example .env
 # optional model variables:
 # - OPENAI_MODEL (default: gpt-4o-mini)
 # - GEMINI_MODEL (default: gemini-1.5-flash)
+# optional AI request timeout (milliseconds):
+# - AI_HTTP_TIMEOUT_MS (default: 60000)
+# optional KPI threshold:
+# - CPU_ALERT_CORES (example: 0.7 for 70% of one core)
 npm start
 ```
 
@@ -227,6 +231,33 @@ curl -X POST http://localhost:8080/api/ai/execute \
     ]
   }'
 ```
+
+Inspect 503 recovery behavior:
+- If upstream AI provider returns `429` or `5xx` (including `503`), backend now returns a degraded-but-successful inspect response with safe diagnostic commands instead of failing the request.
+- The UI shows an explicit `AI degraded mode` warning banner while still rendering AI Insight content; retry Inspect after provider recovers.
+
+Quick backend diagnostics for Inspect failures:
+
+```bash
+cd /Users/anushasg/www/backend
+npm run dev
+```
+
+In another terminal:
+
+```bash
+curl -s -X POST http://localhost:8080/api/ai/inspect \
+  -H "Content-Type: application/json" \
+  -d '{
+    "namespace":"simulation",
+    "selectedPod":"healthy-baseline-api",
+    "tail":20
+  }' | jq
+```
+
+If no LLM key is configured, set one in `backend/.env` and restart backend:
+- `OPENAI_API_KEY=...` (preferred), or
+- `GEMINI_API_KEY=...`
 
 ## 11) Simulation environment commands
 

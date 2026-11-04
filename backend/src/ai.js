@@ -10,10 +10,12 @@ const execAsync = promisify(exec);
 const DEFAULT_TAIL = 200;
 const INSPECT_TAIL_LINES = 20;
 const MAX_EVIDENCE_LOG_CHARS = 2000;
+const AI_HTTP_TIMEOUT_MS = Number(process.env.AI_HTTP_TIMEOUT_MS || 60000);
 
 const inspectResponseSchema = z.object({
   one_liner_reason: z.string().min(1),
   details: z.array(z.string()).default([]),
+  confidence_score: z.number().min(0).max(100).optional().nullable(),
   commands: z
     .array(
       z.object({
@@ -100,6 +102,7 @@ function buildInspectPrompts({ evidence, priorAttempt }) {
     "Focus on namespace-scoped commands only.",
     "Use safe kubectl commands and include namespace explicitly using -n <namespace> or --namespace <namespace>.",
     "Provide at least one executable remediation command unless manual_action_required=true.",
+    "Provide confidence_score as a number from 0 to 100 based only on the evidence quality and consistency.",
     "Prefer this command set only:",
     "kubectl get ... -n <namespace>",
     "kubectl describe ... -n <namespace>",
@@ -120,6 +123,49 @@ function buildInspectPrompts({ evidence, priorAttempt }) {
   return {
     systemPrompt,
     userPrompt: JSON.stringify(userPayload, null, 2)
+  };
+}
+
+function buildProviderUnavailableFallback({ namespace, selectedPod, evidence, cause }) {
+  const targetPod = selectedPod || evidence?.pods?.[0]?.name || "unknown-pod";
+  const details = [
+    `AI provider is temporarily unavailable: ${cause}`,
+    `Continue diagnosis from recent pod evidence for '${targetPod}' in namespace '${namespace}'.`,
+    "Use the suggested low-risk diagnostics below, then retry Inspect."
+  ];
+
+  return {
+    namespace,
+    selectedPod: targetPod,
+    evidence_summary: {
+      pod_count: evidence?.pods?.length || 0,
+      metric_rows: evidence?.metrics?.length || 0
+    },
+    one_liner_reason: "AI provider unavailable; proceed with manual, evidence-first diagnostics.",
+    details,
+    confidence_score: null,
+    commands: [
+      {
+        id: "fallback-describe",
+        title: "Inspect pod events and failure reasons",
+        command: `kubectl describe pod ${targetPod} -n ${namespace}`,
+        rationale: "Describe output usually reveals immediate scheduling, image, probe, or restart causes.",
+        risk: "low",
+        requires_manual: false
+      },
+      {
+        id: "fallback-logs",
+        title: "Fetch recent logs for the selected pod",
+        command: `kubectl logs ${targetPod} -n ${namespace} --tail=100`,
+        rationale: "Recent logs provide direct error context while AI service is unavailable.",
+        risk: "low",
+        requires_manual: false
+      }
+    ],
+    manual_action_required: false,
+    manual_action_message: "",
+    risk_level: "medium",
+    degraded_mode: true
   };
 }
 
@@ -148,10 +194,15 @@ async function callOpenAIInspect({ systemPrompt, userPrompt }) {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json"
         },
-        timeout: 25000
+        timeout: AI_HTTP_TIMEOUT_MS
       }
     );
   } catch (err) {
+    if (err.code === "ECONNABORTED") {
+      throw new Error(
+        `OpenAI request timed out after ${AI_HTTP_TIMEOUT_MS}ms. Retry Inspect or increase AI_HTTP_TIMEOUT_MS in backend/.env.`
+      );
+    }
     if (err.response?.status === 429) {
       throw new Error(
         "OpenAI rate limit reached (429). Please wait a moment or check your OpenAI billing/quota, then retry Inspect."
@@ -211,10 +262,15 @@ async function callGeminiInspect({ systemPrompt, userPrompt }) {
         },
         {
           headers: { "Content-Type": "application/json" },
-          timeout: 25000
+          timeout: AI_HTTP_TIMEOUT_MS
         }
       );
     } catch (err) {
+      if (err.code === "ECONNABORTED") {
+        throw new Error(
+          `Gemini request timed out after ${AI_HTTP_TIMEOUT_MS}ms. Retry Inspect or increase AI_HTTP_TIMEOUT_MS in backend/.env.`
+        );
+      }
       if (err.response?.status === 404) {
         last404Model = model;
         continue;
@@ -273,7 +329,23 @@ async function inspectIncident({ namespace, selectedPod, tail: _tail, priorAttem
     logs: evidence.logs
   };
   const prompts = buildInspectPrompts({ evidence: compactEvidence, priorAttempt });
-  const ai = await callLLMInspect(prompts);
+  let ai;
+  try {
+    ai = await callLLMInspect(prompts);
+  } catch (err) {
+    const status = err?.response?.status;
+    const transientProviderError =
+      status === 429 || (Number.isInteger(status) && status >= 500 && status <= 599);
+    if (transientProviderError) {
+      return buildProviderUnavailableFallback({
+        namespace,
+        selectedPod: evidence.selectedPod,
+        evidence,
+        cause: err?.message || `Upstream status ${status}`
+      });
+    }
+    throw err;
+  }
 
   const reason = String(ai.one_liner_reason || "").toLowerCase();
   const looksHealthy =
