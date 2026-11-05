@@ -44,7 +44,12 @@ LLM provider selection behavior:
 - If `OPENAI_API_KEY` is set, backend uses OpenAI for Inspect.
 - Else if `GEMINI_API_KEY` is set, backend uses Gemini.
 - If both are missing, Inspect returns a configuration error.
-- For Gemini, if the configured model returns 404, backend automatically tries a small fallback list (`gemini-1.5-flash`, `gemini-1.5-pro`, `gemini-2.0-flash`).
+- Gemini Inspect now uses the `@google/genai` SDK path (interactions API) and tries model fallbacks in order (`GEMINI_MODEL`, then known Gemini variants including `gemini-flash-latest`, `gemini-3.8-flash`, `gemini-2.5-*`, `gemini-2.0-flash`, `gemini-1.5-*`).
+- Gemini Inspect request shape now follows the direct SDK interaction pattern (`ai.interactions.create({ model, input })`), with system/user guidance merged into a single input payload to reduce incompatibility across model variants.
+- If Gemini fallback still fails, Inspect returns a probe summary in the error text (for example `gemini-3.8-flash:503, gemini-1.5-flash:404`) to speed up model/key debugging.
+- Based on live key validation, the default model is now `gemini-3.7-flash`. Fallback prioritizes that model early and skips candidates that return empty/non-JSON output instead of failing the whole inspect request.
+- Timeout behavior: provider timeouts are treated as transient failures; Inspect now returns degraded-mode diagnostics instead of hard-failing the request. For Gemini, timeout on one candidate model also advances to fallback models before failing.
+- When all Gemini candidates are unavailable (`404/5xx/timeout`), Inspect now treats that outcome as transient and returns degraded-mode diagnostics (HTTP 200) instead of a hard API error.
 
 Backend health:
 
@@ -235,6 +240,7 @@ curl -X POST http://localhost:8080/api/ai/execute \
 Inspect 503 recovery behavior:
 - If upstream AI provider returns `429` or `5xx` (including `503`), backend now returns a degraded-but-successful inspect response with safe diagnostic commands instead of failing the request.
 - The UI shows an explicit `AI degraded mode` warning banner while still rendering AI Insight content; retry Inspect after provider recovers.
+- Inspect fallback now resolves deployment-style pod input (for example `memory-simulator`) to a live pod name (for example `memory-simulator-<hash>-<id>`) before generating diagnostic commands.
 
 Quick backend diagnostics for Inspect failures:
 
@@ -286,10 +292,42 @@ Current behavior:
 - selected scenario also runs at `replicas=1`
 - all other simulators remain at `replicas=0`
 
+Memory OOM scenario details (`memory`):
+- The `memory-simulator` container is intentionally configured with a very small memory envelope:
+  - request: `16Mi`
+  - limit: `48Mi`
+- The simulator tries to allocate `96Mi` by default (`MEM_TARGET_MB=96`), which is designed to exceed the container limit and trigger `OOMKilled` even when node memory is mostly free.
+- This demonstrates cgroup-enforced per-container limits (not node-level exhaustion).
+
 Check scenario status:
 
 ```bash
 ./scripts/simulate.sh status crashloop
+```
+
+Run and verify OOMKilled behavior:
+
+```bash
+./scripts/simulate.sh start memory
+kubectl -n simulation get pods -l app=memory-simulator -w
+```
+
+In another terminal, inspect restart reason and exit code:
+
+```bash
+POD=$(kubectl -n simulation get pods -l app=memory-simulator -o jsonpath='{.items[0].metadata.name}')
+kubectl -n simulation describe pod "$POD" | rg "Reason:|Exit Code:|OOMKilled"
+```
+
+Expected signals:
+- `Reason: OOMKilled`
+- `Exit Code: 137`
+
+Apply memory scenario fix (keeps deployment running but lowers allocation):
+
+```bash
+./scripts/simulate.sh fix memory
+kubectl -n simulation rollout restart deployment/memory-simulator
 ```
 
 Trigger interactive auth failure:
@@ -331,4 +369,36 @@ kubectl -n simulation get deployments,pods
 kubectl -n simulation get events --sort-by=.lastTimestamp
 kubectl -n simulation logs deployment/crashloop-simulator --tail=200
 kubectl top pods -n simulation
+```
+
+## 12) AI Insight panel controls
+
+The AI Insight side panel now uses:
+- an icon-only `X` close control in the panel header (replaces text `Close`)
+- a left/right collapse indicator in the header title toggle (replaces up/down)
+- when collapsed, the panel becomes a thin right-edge control bar (expand + close icons) instead of a full-width empty card
+
+No backend restart is needed for this UI-only control update; refresh the frontend page if it is already open.
+
+## 13) Gemini API evidence-first smoke test
+
+Use this script to avoid guesswork and verify exactly what Gemini models are available for your API key with a tiny prompt.
+
+```bash
+cd /Users/anushasg/www/backend
+npm run gemini:test
+```
+
+What it does:
+- loads `GEMINI_API_KEY` from `backend/.env`
+- calls `v1beta/models` and lists key-accessible `generateContent` Gemini models
+- sends a low-token probe prompt (`give one line response`) against prioritized model candidates
+- prints first working model, text response, and usage metadata
+
+Optional:
+
+```bash
+cd /Users/anushasg/www/backend
+node scripts/test-gemini-api.mjs --list-only
+node scripts/test-gemini-api.mjs --model gemini-flash-latest
 ```

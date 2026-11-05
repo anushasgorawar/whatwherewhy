@@ -305,14 +305,14 @@ spec:
             - name: SCENARIO
               value: memory
             - name: MEM_TARGET_MB
-              value: "256"
+              value: "96"
           resources:
             requests:
               cpu: "50m"
-              memory: "64Mi"
+              memory: "16Mi"
             limits:
               cpu: "200m"
-              memory: "128Mi"
+              memory: "48Mi"
           securityContext:
             runAsUser: 1000
             runAsGroup: 1000

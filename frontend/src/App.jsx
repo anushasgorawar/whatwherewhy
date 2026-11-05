@@ -5,6 +5,8 @@ import {
   Boxes,
   CheckCircle2,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   ChevronUp,
   Circle,
   Clock3,
@@ -16,7 +18,8 @@ import {
   Logs,
   PlayCircle,
   ShieldCheck,
-  UserCircle2
+  UserCircle2,
+  X
 } from "lucide-react";
 import { Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import {
@@ -178,6 +181,7 @@ export default function App() {
   }, [selectedPodRow]);
 
   const loadingAny = loadingNamespaces || loadingData || loadingLogs || aiLoading || aiExecuting;
+  const aiPanelCollapsed = showAiInsight && !aiInsightExpanded;
 
   async function loadNamespaces() {
     setLoadingNamespaces(true);
@@ -444,7 +448,11 @@ export default function App() {
 
         <div
           className={`grid grid-cols-1 gap-4 ${
-            showAiInsight ? "xl:[grid-template-columns:minmax(0,74%)_minmax(320px,26%)]" : ""
+            showAiInsight
+              ? aiPanelCollapsed
+                ? "xl:[grid-template-columns:minmax(0,1fr)_56px]"
+                : "xl:[grid-template-columns:minmax(0,74%)_minmax(320px,26%)]"
+              : ""
           }`}
         >
           <main className="space-y-4">
@@ -836,8 +844,33 @@ export default function App() {
           </main>
 
           {showAiInsight && (
-            <aside className="space-y-4">
-              <section className="rounded-card border border-[#E9D5FF] bg-[#FCFAFF] p-4 shadow-soft">
+            <aside className={aiPanelCollapsed ? "" : "space-y-4"}>
+              <section
+                className={`rounded-card border border-[#E9D5FF] bg-[#FCFAFF] shadow-soft ${
+                  aiPanelCollapsed ? "flex min-h-[480px] flex-col items-center justify-between px-2 py-3" : "p-4"
+                }`}
+              >
+                {aiPanelCollapsed ? (
+                  <>
+                    <button
+                      aria-label="Expand AI Insight"
+                      title="Expand AI Insight"
+                      className="inline-flex h-8 w-8 items-center justify-center rounded-btn border border-[#E2E8F0] bg-white text-[#64748B] hover:text-[#0F172A]"
+                      onClick={() => setAiInsightExpanded(true)}
+                    >
+                      <ChevronLeft className="h-4 w-4" />
+                    </button>
+                    <button
+                      aria-label="Close AI Insight"
+                      title="Close AI Insight"
+                      className="inline-flex h-8 w-8 items-center justify-center rounded-btn border border-[#E2E8F0] bg-white text-[#64748B] hover:text-[#0F172A]"
+                      onClick={() => setShowAiInsight(false)}
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </>
+                ) : (
+                  <>
                 <div className="mb-3 flex items-center justify-between">
                   <button
                     className="inline-flex items-center gap-2 rounded-btn border border-transparent px-1 py-1 text-left"
@@ -846,17 +879,19 @@ export default function App() {
                     <Bot className="h-5 w-5 text-[#7C3AED]" />
                     <h2 className="text-base font-semibold text-[#0F172A]">AI Insight</h2>
                     {aiInsightExpanded ? (
-                      <ChevronUp className="h-4 w-4 text-[#64748B]" />
+                      <ChevronRight className="h-4 w-4 text-[#64748B]" />
                     ) : (
-                      <ChevronDown className="h-4 w-4 text-[#64748B]" />
+                      <ChevronLeft className="h-4 w-4 text-[#64748B]" />
                     )}
                   </button>
                   <div className="flex items-center gap-2">
                     <button
-                      className="rounded-btn border border-[#E2E8F0] bg-white px-2 py-0.5 text-xs text-[#64748B]"
+                      aria-label="Close AI Insight"
+                      title="Close AI Insight"
+                      className="inline-flex h-7 w-7 items-center justify-center rounded-btn border border-[#E2E8F0] bg-white text-[#64748B] hover:text-[#0F172A]"
                       onClick={() => setShowAiInsight(false)}
                     >
-                      Close
+                      <X className="h-4 w-4" />
                     </button>
                   </div>
                 </div>
@@ -959,6 +994,8 @@ export default function App() {
                         </div>
                       </div>
                     )}
+                  </>
+                )}
                   </>
                 )}
               </section>

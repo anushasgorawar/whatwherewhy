@@ -5,9 +5,11 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "gemini:test": "node scripts/test-gemini-api.mjs"
   },
   "dependencies": {
+    "@google/genai": "^2.32.0",
     "@kubernetes/client-node": "^1.0.0",
     "axios": "^1.7.7",
     "cors": "^2.8.5",
