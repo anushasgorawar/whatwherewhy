@@ -261,9 +261,104 @@ Historically, operators needed separate CLI commands and mental cross-referencin
 
 A follow-up frontend styling pass increased color salience across summary cards, usage panels, table regions, and AI context surfaces to make state-group boundaries immediately visible during active monitoring. The prior visual treatment was functionally correct but could appear too neutral in some local runs, reducing perceptual separation between informational layers. Strengthening card-level color regions improves figure-ground contrast and supports faster first-pass scanning without changing data flow or interaction logic.
 
+## AI Panel Progressive Disclosure Update
+
+The AI Insight panel is now hidden by default and appears only when an operator explicitly clicks `Inspect` on a pod context. Once visible, the panel supports both collapse/expand behavior and a direct close action that cancels the visible AI side panel state without affecting core observability views. This change reduces persistent interface density and aligns with progressive disclosure: advanced AI reasoning is available on demand, while the default screen remains focused on primary monitoring evidence.
+
+## Log Evidence Scope Tuning Update
+
+The default log tail size in the interface has been reduced from 200 lines to 20 lines for initial pod inspection. This narrows first-pass evidence to the most recent context, lowers visual noise in the logs panel, and reduces unnecessary payload volume during inspect-triggered diagnosis while preserving operator control to increase the tail size when deeper history is needed.
+
+## AI Panel Label Simplification Update
+
+The AI Insight panel badge has been simplified by removing the visible "Beta" label. This reduces nonessential status tagging in the primary investigation surface and keeps operator attention on evidence, diagnosis, and action controls rather than product-stage signaling.
+
+## Header Terminology Tightening Update
+
+The dashboard header language has been tightened from conversational copy to strict operational wording ("Monitoring Dashboard"), and supporting tagline text was removed. This reduces ambiguity in system identity and keeps the interface voice aligned with production monitoring expectations.
+
+## Header Status Simplification Update
+
+The header status area has been simplified by removing separate "Live" and "Syncing" labels and relying on explicit timestamp feedback instead. The timestamp label is now presented as "Last Synced" to match operator mental models for data freshness and reduce duplicate status messaging in the top bar.
+
+## Needs-Attention Health Rule Update
+
+The `Needs Attention` KPI has been tightened to reflect explicit pod health semantics rather than broad phase-only counts. A pod is now counted only when it is not running, not ready, or exhibits concrete runtime failure signals (for example crash loops, image-pull failures, container start errors, OOM-related termination traces, or restart activity). This improves triage precision by reducing false alarms from otherwise stable running pods and aligning KPI behavior with operational health expectations.
+
+The rule has been refined further to avoid counting pods solely due to historical restart counters. `Needs Attention` now prioritizes current readiness/phase and explicit failure-state reasons, reducing stale-alert carryover after pods recover.
+
+The health rule has also been constrained to current-state failure signals only (active waiting/terminated reasons), excluding historical `lastState` artifacts that can persist after pod recovery. This prevents recovered pods from remaining flagged due to stale lifecycle traces.
+
+Succeeded-completion semantics are now handled explicitly: pods in Kubernetes phase `Succeeded` are excluded from `Needs Attention` counts so completed one-shot workloads are not misclassified as active incidents.
+
+## High-CPU Threshold Configuration Update
+
+The High CPU KPI now uses an explicit operator-configured threshold through `CPU_ALERT_CORES` in `backend/.env`. The local configuration has been set to `0.7` (interpreted as 70% of one CPU core) to align alert behavior with expected incident sensitivity while keeping the threshold auditable and adjustable.
+
+## KPI-Driven Pod Filtering Update
+
+The `Needs Attention` and `High CPU Containers` KPI cards now support direct click-to-filter interactions for the pods table. This adds a tighter diagnosis loop from summary signal to affected workload list within the same namespace, reducing manual scan effort and supporting faster evidence drill-down.
+
+The `Pods Running` KPI now also acts as an explicit reset control to return the table view to all pods in the selected namespace after drill-down filtering. This preserves a clear "back to full scope" interaction in the same summary row.
+
+KPI helper microcopy for click actions has been removed to reduce visual clutter in the summary row; interaction affordance is now conveyed through direct card behavior and active-selection styling.
+
+The per-pod `More` interaction has been hardened for reliability under live polling by tightening detail-panel state handling around explicit pod expansion context. This reduces transient non-expansion behavior when pod lists update during active monitoring.
+
+Detail drill-down panels (`Metrics`, `Logs`, `YAML`, `Events`) are now rendered inline directly beneath the selected pod row rather than in a detached section below the table. This strengthens object-action proximity and reduces context switching during per-pod investigation.
+
+## AI Timeout Handling Update
+
+LLM inspect request timeout handling has been made explicit and configurable. Backend model calls now use `AI_HTTP_TIMEOUT_MS` (default 60000ms) instead of a fixed 25000ms cap, and timeout failures return provider-specific actionable messages. This improves runtime robustness under slower API responses while preserving transparent operator feedback.
+
+## Confidence Display Removal Update
+
+The AI panel confidence visualization has been removed from the operator UI. This aligns the interface with the current evidence-first scope by avoiding partially defined trust signals until a validated confidence methodology is implemented and evaluated.
+
+## Simulation Script Reliability Update
+
+The simulation startup helper (`scripts/simulate.sh`) has been corrected to remove a stale variable reference in the scenario-start message path. This prevented scenario startup from completing under strict shell settings (`set -u`) even though resources were correctly installed. The fix restores deterministic scenario activation so simulation exercises can be launched without manual script edits during HCI evaluation runs.
+
+## AI Provider Outage Fallback Update
+
+The Inspect pipeline has been hardened against transient upstream LLM outages (notably HTTP `503` and other provider-side `5xx` conditions, plus `429` rate limits). Instead of failing the UI request, the backend now returns a degraded-but-valid inspect response containing a concise outage notice and low-risk namespace-scoped diagnostic commands (for example `kubectl describe` and `kubectl logs` on the selected pod). The frontend now surfaces this state with an explicit "AI degraded mode" warning banner rather than a generic error tone. This matters to the research direction because it preserves continuity of evidence-first investigation and human decision support even when AI generation is temporarily unavailable, while improving operator mental-model clarity about system state.
+
+## Container-Limit OOM Simulation Update
+
+The memory-failure simulator has been recalibrated to model container-scoped OOM behavior under minimal limits. The `memory-simulator` now uses `requests.memory=16Mi` and `limits.memory=48Mi`, while default failure mode targets a higher allocation (`MEM_TARGET_MB=96`). This creates an explicit condition where a pod can be `OOMKilled` with `Exit Code 137` despite ample free memory at node level, aligning the prototype with the intended cgroup-based failure semantics. This matters to the research direction because it strengthens evidence validity for the "What Broke?" stage by distinguishing container-limit violations from cluster-capacity exhaustion.
+
+## Degraded-Inspect Pod Resolution Update
+
+The degraded Inspect fallback path has been refined to improve command correctness when operators provide deployment-style pod identifiers (for example `memory-simulator`) instead of full live pod names. The backend now resolves these inputs to active pod instances before generating fallback diagnostics, and provider outage messaging has been normalized for readability. This matters to the research direction because fallback guidance remains executable and legible under AI-provider outage conditions, preserving continuity in human-led evidence review.
+
+## Gemini Model Availability Fallback Update
+
+Provider-model availability handling has been expanded for Gemini Inspect calls. Model fallback is no longer limited to `404` model-not-found responses; it now also advances through known fallback models when a model endpoint returns transient `5xx` availability errors. In addition, the environment template default has been aligned to a known baseline (`gemini-1.5-flash`) to reduce configuration drift. This matters to the research direction because it reduces avoidable degraded-mode transitions caused by model-endpoint instability, preserving continuity of AI-assisted explanation during incident diagnosis.
+
+An additional diagnostics refinement now emits per-model probe status in Gemini failure messages (for example, `model-a:404`, `model-b:503`). This improves operational transparency by turning opaque provider errors into actionable evidence for configuration and availability triage.
+
+Timeout handling has also been aligned with the same continuity goal: provider timeouts are now treated as transient failures and trigger degraded-mode Inspect responses rather than hard request failures. For Gemini, timeout on one model candidate now advances to fallback candidates before concluding failure. This reduces abrupt interaction breaks during provider instability while preserving evidence-first operator flow.
+
+Failure handling has been tightened further for Gemini model-probe exhaustion: when all configured/fallback model candidates are unavailable, the Inspect endpoint now classifies that outcome as transient and returns degraded-mode guidance instead of an HTTP error response. This keeps the inspection loop operational under broad provider/model availability failures.
+
+Gemini integration has also been migrated from raw REST calls to the official `@google/genai` SDK interactions path, with ordered model fallback across multiple Gemini variants. This aligns backend request semantics with current Gemini client behavior and reduces incompatibility risk from endpoint-shape drift. The change improves the probability of obtaining an actionable Inspect response under account-specific model availability differences.
+
+The integration has been further tightened to use the simplest interaction call form (`interactions.create` with consolidated input text) rather than mixed request-shape features. This reduces cross-model incompatibility risk and lowers timeout/failure probability under account-variant Gemini capabilities.
+
+Model-priority defaults were also adjusted to prefer `gemini-flash-latest` before fixed-version Gemini variants. This aligns backend behavior with API keys that expose alias-based model access more reliably than version-pinned names, reducing avoidable inspection failures under provider-side rollout differences.
+
+To support cost-aware, evidence-first API validation, a standalone Gemini smoke-test script has been added in backend tooling. The script enumerates key-accessible `generateContent` models and executes a minimal prompt probe with usage reporting, producing concrete model-availability evidence before integration changes are made. This reduces iteration waste and prevents repeated speculative calls under paid API constraints.
+
+Follow-up evidence from the smoke-test has been operationalized in backend defaults: `gemini-3.7-flash` is now prioritized as the initial inspect model, and candidates that return empty/non-JSON outputs are treated as model-incompatibility fallbacks rather than terminal request failures. This converts observed model-behavior variance into deterministic provider-selection logic and improves inspect success probability without increasing interaction complexity.
+
+## AI Insight Header Control Update
+
+The AI Insight panel header controls have been refined for denser incident-workflow ergonomics: the text-based close action has been replaced by an icon-only `X` control, and the disclosure affordance now uses left/right directional collapse cues instead of up/down. The collapsed state now renders as a thin right-edge control bar rather than a full-size panel container. This improves spatial mapping for a right-side panel, reduces persistent visual load, and preserves quick re-entry into AI assistance during monitoring.
+
 ## Next Paper-Facing Steps
 
 1. Expand the abstract beyond the opening paragraph with problem statement, method framing, and expected contribution.
 2. Draft section outlines for diagnosis, explanation, and action-approval interaction design.
 3. Define evaluation criteria (e.g., understanding, confidence, and safer action selection).
 4. Run a consistency pass so all sections preserve the same HCI thesis and terminology.
+

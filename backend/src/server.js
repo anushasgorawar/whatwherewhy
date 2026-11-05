@@ -25,13 +25,13 @@ const logsSchema = z.object({
   namespace: z.string().min(1).max(63),
   pod: z.string().min(1),
   container: z.string().optional(),
-  tail: z.coerce.number().int().min(10).max(1000).default(200)
+  tail: z.coerce.number().int().min(10).max(1000).default(20)
 });
 
 const aiInspectSchema = z.object({
   namespace: z.string().min(1).max(63),
   selectedPod: z.string().min(1).optional(),
-  tail: z.coerce.number().int().min(10).max(1000).default(200),
+  tail: z.coerce.number().int().min(10).max(1000).default(20),
   priorAttempt: z
     .object({
       previousReason: z.string().optional(),
@@ -53,8 +53,63 @@ const aiExecuteSchema = z.object({
     .min(1)
 });
 
+function podHasIssues(pod) {
+  const phase = pod?.status?.phase || "Unknown";
+  if (phase === "Succeeded") return false;
+  if (phase !== "Running") return true;
+
+  const readyCondition = (pod?.status?.conditions || []).find((c) => c.type === "Ready");
+  if (!readyCondition || readyCondition.status !== "True") return true;
+
+  const containerStatuses = pod?.status?.containerStatuses || [];
+  if (containerStatuses.length === 0) return true;
+
+  for (const status of containerStatuses) {
+    const waitingReason = status?.state?.waiting?.reason || "";
+    const terminatedReason = status?.state?.terminated?.reason || "";
+    const reasons = [waitingReason, terminatedReason].filter(Boolean);
+
+    if (
+      reasons.some((reason) =>
+        [
+          "CrashLoopBackOff",
+          "ImagePullBackOff",
+          "ErrImagePull",
+          "CreateContainerConfigError",
+          "CreateContainerError",
+          "RunContainerError",
+          "OOMKilled",
+          "Error"
+        ].includes(reason)
+      )
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 app.get("/healthz", (_req, res) => {
   res.json({ ok: true });
+});
+
+app.get("/api/cluster/status", async (_req, res) => {
+  try {
+    const { core } = getClients();
+    const list = await core.listNamespace();
+    res.json({
+      connected: true,
+      namespaceCount: (list.items || []).length,
+      checkedAt: new Date().toISOString()
+    });
+  } catch (err) {
+    res.status(503).json({
+      connected: false,
+      checkedAt: new Date().toISOString(),
+      error: err.message || "Cluster connection check failed."
+    });
+  }
 });
 
 app.get("/api/namespaces", async (_req, res) => {
@@ -186,6 +241,60 @@ app.get("/api/metrics/namespaces-summary", async (_req, res) => {
   } catch (err) {
     res.status(500).json({
       error: err.message || "Failed to fetch namespace metrics summary from metrics-server."
+    });
+  }
+});
+
+app.get("/api/dashboard/summary", async (req, res) => {
+  try {
+    const { namespace } = namespaceSchema.parse(req.query);
+    const { core } = getClients();
+    const list = await core.listNamespacedPod({ namespace });
+    const pods = (list.items || []).map(summarizePod);
+
+    let metrics = [];
+    let metricsAvailable = true;
+    try {
+      metrics = await fetchPodMetricsFromMetricsServer(namespace);
+    } catch (_err) {
+      metricsAvailable = false;
+      metrics = [];
+    }
+
+    const rawPods = list.items || [];
+    const runningPods = pods.filter((pod) => pod.phase === "Running").length;
+    const needsAttentionPodItems = rawPods.filter((pod) => podHasIssues(pod));
+    const needsAttentionPodNames = needsAttentionPodItems
+      .map((pod) => pod?.metadata?.name)
+      .filter(Boolean);
+    const needsAttentionPods = needsAttentionPodNames.length;
+
+    const thresholdRaw = process.env.CPU_ALERT_CORES;
+    const threshold = Number(thresholdRaw);
+    const hasThreshold = Number.isFinite(threshold) && threshold > 0;
+
+    const highCpuMetricRows = hasThreshold
+      ? metrics.filter((metric) => Number(metric.cpuCores || 0) >= threshold)
+      : [];
+    const highCpuContainers = hasThreshold ? highCpuMetricRows.length : null;
+    const highCpuPodNames = hasThreshold
+      ? Array.from(new Set(highCpuMetricRows.map((row) => row.pod).filter(Boolean)))
+      : [];
+
+    res.json({
+      namespace,
+      runningPods,
+      needsAttentionPods,
+      needsAttentionPodNames,
+      highCpuContainers,
+      highCpuPodNames,
+      highCpuThresholdCores: hasThreshold ? threshold : null,
+      metricsAvailable,
+      metricRows: metrics.length
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err.message || "Failed to compute dashboard summary."
     });
   }
 });

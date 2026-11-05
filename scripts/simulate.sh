@@ -42,7 +42,7 @@ require_scenario() {
 reset_defaults() {
   kubectl -n "${NAMESPACE}" set env deployment/crashloop-simulator FAIL_MODE=true >/dev/null
   kubectl -n "${NAMESPACE}" set env deployment/cpu-simulator CPU_SATURATION=true >/dev/null
-  kubectl -n "${NAMESPACE}" set env deployment/memory-simulator MEM_TARGET_MB=256 >/dev/null
+  kubectl -n "${NAMESPACE}" set env deployment/memory-simulator MEM_TARGET_MB=96 >/dev/null
   kubectl -n "${NAMESPACE}" set env deployment/readiness-simulator READINESS_FAIL=true >/dev/null
   kubectl -n "${NAMESPACE}" set env deployment/config-simulator CONFIG_MODE- >/dev/null || true
   kubectl -n "${NAMESPACE}" patch configmap/config-simulator-settings \
@@ -82,7 +82,7 @@ cmd_start() {
   reset_defaults
   scale_healthy_baseline
   kubectl -n "${NAMESPACE}" scale deployment/"${target_dep}" --replicas=1 >/dev/null
-  echo "Started scenario '${scenario}' (${target_dep}) with healthy baseline '${HEALTHY_BASELINE_DEPLOYMENT}' also running."
+  echo "Started scenario '${scenario}' (${target_dep}) with healthy baseline deployments also running."
 }
 
 cmd_status() {
@@ -141,7 +141,7 @@ cmd_fix() {
       kubectl -n "${NAMESPACE}" set env deployment/cpu-simulator CPU_SATURATION=false
       ;;
     memory)
-      kubectl -n "${NAMESPACE}" set env deployment/memory-simulator MEM_TARGET_MB=64
+      kubectl -n "${NAMESPACE}" set env deployment/memory-simulator MEM_TARGET_MB=8
       ;;
     readiness)
       kubectl -n "${NAMESPACE}" set env deployment/readiness-simulator READINESS_FAIL=false

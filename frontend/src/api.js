@@ -45,7 +45,7 @@ export async function fetchPods(namespace = "default") {
   return request(`/api/pods?namespace=${encodeURIComponent(namespace)}`);
 }
 
-export async function fetchLogs({ namespace, pod, container, tail = 200 }) {
+export async function fetchLogs({ namespace, pod, container, tail = 20 }) {
   const params = new URLSearchParams({
     namespace,
     pod,
@@ -65,7 +65,15 @@ export async function fetchNamespaceMetricsSummary() {
   return request("/api/metrics/namespaces-summary");
 }
 
-export async function inspectWithAI({ namespace, selectedPod, tail = 200, priorAttempt }) {
+export async function fetchClusterStatus() {
+  return request("/api/cluster/status");
+}
+
+export async function fetchDashboardSummary(namespace = "default") {
+  return request(`/api/dashboard/summary?namespace=${encodeURIComponent(namespace)}`);
+}
+
+export async function inspectWithAI({ namespace, selectedPod, tail = 20, priorAttempt }) {
   return requestPost("/api/ai/inspect", {
     namespace,
     selectedPod,

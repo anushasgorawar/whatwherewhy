@@ -10,10 +10,12 @@ const execAsync = promisify(exec);
 const DEFAULT_TAIL = 200;
 const INSPECT_TAIL_LINES = 20;
 const MAX_EVIDENCE_LOG_CHARS = 2000;
+const AI_HTTP_TIMEOUT_MS = Number(process.env.AI_HTTP_TIMEOUT_MS || 60000);
 
 const inspectResponseSchema = z.object({
   one_liner_reason: z.string().min(1),
   details: z.array(z.string()).default([]),
+  confidence_score: z.number().min(0).max(100).optional().nullable(),
   commands: z
     .array(
       z.object({
@@ -35,6 +37,77 @@ function trimEvidence(text, maxChars = MAX_EVIDENCE_LOG_CHARS) {
   if (!text) return "";
   if (text.length <= maxChars) return text;
   return `${text.slice(0, maxChars)}\n...[truncated]`;
+}
+
+function resolvePodName(selectedPod, pods) {
+  const podNames = (pods || []).map((pod) => pod.name).filter(Boolean);
+  if (podNames.length === 0) return "";
+  if (!selectedPod) return podNames[0];
+  if (podNames.includes(selectedPod)) return selectedPod;
+
+  // Allow deployment-style input (e.g., "memory-simulator") by mapping to a live pod name.
+  const withDashMatch = podNames.find((name) => name.startsWith(`${selectedPod}-`));
+  if (withDashMatch) return withDashMatch;
+
+  const containsMatch = podNames.find((name) => name.includes(selectedPod));
+  if (containsMatch) return containsMatch;
+
+  return podNames[0];
+}
+
+function normalizeProviderErrorMessage(cause) {
+  const text = String(cause || "Upstream provider failure");
+  return text.replace(/status code(\d{3})\b/i, "status code $1");
+}
+
+function makeTransientProviderError(message, code = "TRANSIENT_PROVIDER_ERROR") {
+  const err = new Error(message);
+  err.code = code;
+  err.isTransientProviderFailure = true;
+  return err;
+}
+
+function normalizeGeminiModelName(modelName) {
+  return String(modelName || "").replace(/^models\//, "").trim();
+}
+
+async function getGoogleGenAI(apiKey) {
+  const mod = await import("@google/genai");
+  const GoogleGenAI = mod?.GoogleGenAI;
+  if (!GoogleGenAI) {
+    throw new Error("Failed to load @google/genai (GoogleGenAI export missing).");
+  }
+  if (apiKey) {
+    process.env.GEMINI_API_KEY = apiKey;
+  }
+  // Align with SDK usage where constructor reads env key by default.
+  return new GoogleGenAI({});
+}
+
+async function withTimeout(task, ms, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      task(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          reject(makeTransientProviderError(message, "ECONNABORTED"));
+        }, ms);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function isTransientProviderFailure(err) {
+  if (err?.isTransientProviderFailure) return true;
+  const status = err?.response?.status;
+  if (status === 429) return true;
+  if (Number.isInteger(status) && status >= 500 && status <= 599) return true;
+  if (err?.code === "ECONNABORTED") return true;
+  const msg = String(err?.message || "").toLowerCase();
+  return msg.includes("timed out");
 }
 
 async function fetchPodLogs(namespace, pod, container, tail = DEFAULT_TAIL) {
@@ -70,7 +143,7 @@ async function collectIncidentEvidence({ namespace, selectedPod, tail = DEFAULT_
     metrics = [];
   }
 
-  const fallbackPod = selectedPod || pods[0]?.name || "";
+  const fallbackPod = resolvePodName(selectedPod, pods);
   const selectedPodObj = pods.find((pod) => pod.name === fallbackPod);
   const selectedContainer = selectedPodObj?.containers?.[0] || "";
 
@@ -100,6 +173,7 @@ function buildInspectPrompts({ evidence, priorAttempt }) {
     "Focus on namespace-scoped commands only.",
     "Use safe kubectl commands and include namespace explicitly using -n <namespace> or --namespace <namespace>.",
     "Provide at least one executable remediation command unless manual_action_required=true.",
+    "Provide confidence_score as a number from 0 to 100 based only on the evidence quality and consistency.",
     "Prefer this command set only:",
     "kubectl get ... -n <namespace>",
     "kubectl describe ... -n <namespace>",
@@ -120,6 +194,50 @@ function buildInspectPrompts({ evidence, priorAttempt }) {
   return {
     systemPrompt,
     userPrompt: JSON.stringify(userPayload, null, 2)
+  };
+}
+
+function buildProviderUnavailableFallback({ namespace, selectedPod, evidence, cause }) {
+  const targetPod = resolvePodName(selectedPod, evidence?.pods || []) || "unknown-pod";
+  const normalizedCause = normalizeProviderErrorMessage(cause);
+  const details = [
+    `AI provider is temporarily unavailable: ${normalizedCause}`,
+    `Continue diagnosis from recent pod evidence for '${targetPod}' in namespace '${namespace}'.`,
+    "Use the suggested low-risk diagnostics below, then retry Inspect."
+  ];
+
+  return {
+    namespace,
+    selectedPod: targetPod,
+    evidence_summary: {
+      pod_count: evidence?.pods?.length || 0,
+      metric_rows: evidence?.metrics?.length || 0
+    },
+    one_liner_reason: "AI provider unavailable; proceed with manual, evidence-first diagnostics.",
+    details,
+    confidence_score: null,
+    commands: [
+      {
+        id: "fallback-describe",
+        title: "Inspect pod events and failure reasons",
+        command: `kubectl describe pod ${targetPod} -n ${namespace}`,
+        rationale: "Describe output usually reveals immediate scheduling, image, probe, or restart causes.",
+        risk: "low",
+        requires_manual: false
+      },
+      {
+        id: "fallback-logs",
+        title: "Fetch recent logs for the selected pod",
+        command: `kubectl logs ${targetPod} -n ${namespace} --tail=100`,
+        rationale: "Recent logs provide direct error context while AI service is unavailable.",
+        risk: "low",
+        requires_manual: false
+      }
+    ],
+    manual_action_required: false,
+    manual_action_message: "",
+    risk_level: "medium",
+    degraded_mode: true
   };
 }
 
@@ -148,13 +266,21 @@ async function callOpenAIInspect({ systemPrompt, userPrompt }) {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json"
         },
-        timeout: 25000
+        timeout: AI_HTTP_TIMEOUT_MS
       }
     );
   } catch (err) {
+    if (err.code === "ECONNABORTED") {
+      const timeoutErr = makeTransientProviderError(
+        `OpenAI request timed out after ${AI_HTTP_TIMEOUT_MS}ms. Retry Inspect or increase AI_HTTP_TIMEOUT_MS in backend/.env.`
+      );
+      timeoutErr.code = "ECONNABORTED";
+      throw timeoutErr;
+    }
     if (err.response?.status === 429) {
-      throw new Error(
-        "OpenAI rate limit reached (429). Please wait a moment or check your OpenAI billing/quota, then retry Inspect."
+      throw makeTransientProviderError(
+        "OpenAI rate limit reached (429). Please wait a moment or check your OpenAI billing/quota, then retry Inspect.",
+        "OPENAI_RATE_LIMIT"
       );
     }
     throw err;
@@ -183,70 +309,115 @@ async function callGeminiInspect({ systemPrompt, userPrompt }) {
     throw new Error("GEMINI_API_KEY is not configured on backend.");
   }
 
-  const configuredModel = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+  const configuredModel = normalizeGeminiModelName(process.env.GEMINI_MODEL || "gemini-3.7-flash");
   const candidateModels = Array.from(
-    new Set([configuredModel, "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"])
+    new Set([
+      configuredModel,
+      "gemini-3.7-flash",
+      "gemini-flash-latest",
+      "gemini-flash-lite-latest",
+      "gemini-3.8-flash",
+      "gemini-3.8-pro",
+      "gemini-2.5-flash",
+      "gemini-2.5-pro",
+      "gemini-2.0-flash",
+      "gemini-1.5-flash",
+      "gemini-1.5-pro"
+    ])
   );
 
-  let last404Model = "";
+  const ai = await getGoogleGenAI(apiKey);
+  let lastUnavailableModel = "";
+  const probeResults = [];
   for (const model of candidateModels) {
-    let response;
     try {
-      response = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-        {
-          systemInstruction: {
-            parts: [{ text: systemPrompt }]
-          },
-          contents: [
-            {
-              role: "user",
-              parts: [{ text: userPrompt }]
-            }
-          ],
-          generationConfig: {
-            temperature: 0.2,
-            responseMimeType: "application/json"
-          }
-        },
-        {
-          headers: { "Content-Type": "application/json" },
-          timeout: 25000
-        }
+      const mergedInput = [
+        "You are a Kubernetes incident response assistant.",
+        "Return ONLY valid JSON (no markdown).",
+        systemPrompt,
+        "",
+        userPrompt
+      ].join("\n");
+      const interaction = await withTimeout(
+        () =>
+          ai.interactions.create({
+            model,
+            input: mergedInput
+          }),
+        AI_HTTP_TIMEOUT_MS,
+        `Gemini request timed out after ${AI_HTTP_TIMEOUT_MS}ms. Retry Inspect or increase AI_HTTP_TIMEOUT_MS in backend/.env.`
       );
+
+      const content = interaction?.output_text;
+      if (!content) {
+        throw new Error("Gemini response did not include output_text.");
+      }
+
+      let parsed;
+      try {
+        parsed = JSON.parse(content);
+      } catch (_err) {
+        const jsonMatch = content.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) {
+          throw new Error("Gemini response was not valid JSON.");
+        }
+        parsed = JSON.parse(jsonMatch[0]);
+      }
+      return inspectResponseSchema.parse(parsed);
     } catch (err) {
-      if (err.response?.status === 404) {
-        last404Model = model;
+      const status = err?.status || err?.statusCode || err?.response?.status;
+      const message = String(err?.message || "").toLowerCase();
+
+      if (err.code === "ECONNABORTED" || message.includes("timed out") || message.includes("deadline")) {
+        probeResults.push(`${model}:timeout`);
+        lastUnavailableModel = model;
         continue;
       }
-      if (err.response?.status === 429) {
-        throw new Error(
-          "Gemini rate limit reached (429). Please wait a moment or check your Gemini quota, then retry Inspect."
+
+      if (status === 404 || message.includes("not found")) {
+        probeResults.push(`${model}:404`);
+        lastUnavailableModel = model;
+        continue;
+      }
+      if (message.includes("did not include output_text")) {
+        probeResults.push(`${model}:empty-output`);
+        lastUnavailableModel = model;
+        continue;
+      }
+      if (message.includes("not valid json")) {
+        probeResults.push(`${model}:non-json`);
+        lastUnavailableModel = model;
+        continue;
+      }
+      if (Number.isInteger(status) && status >= 500 && status <= 599) {
+        probeResults.push(`${model}:${status}`);
+        lastUnavailableModel = model;
+        continue;
+      }
+      if (status === 400 || status === 401 || status === 403) {
+        probeResults.push(`${model}:${status}`);
+        lastUnavailableModel = model;
+        continue;
+      }
+      if (status === 429) {
+        throw makeTransientProviderError(
+          "Gemini rate limit reached (429). Please wait a moment or check your Gemini quota, then retry Inspect.",
+          "GEMINI_RATE_LIMIT"
         );
+      }
+      if (Number.isInteger(status)) {
+        probeResults.push(`${model}:${status}`);
+      } else {
+        probeResults.push(`${model}:${err.code || "error"}`);
       }
       throw err;
     }
-
-    const content = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!content) {
-      throw new Error("Gemini response did not include content.");
-    }
-
-    let parsed;
-    try {
-      parsed = JSON.parse(content);
-    } catch (_err) {
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        throw new Error("Gemini response was not valid JSON.");
-      }
-      parsed = JSON.parse(jsonMatch[0]);
-    }
-    return inspectResponseSchema.parse(parsed);
   }
 
-  throw new Error(
-    `Gemini model '${last404Model || configuredModel}' was not found (404), and fallback models were unavailable for this key. Set GEMINI_MODEL in backend/.env to a model available in your account.`
+  const probeSummary = probeResults.length > 0 ? ` Probe results: ${probeResults.join(", ")}.` : "";
+  throw makeTransientProviderError(
+    `Gemini model '${lastUnavailableModel || configuredModel}' was unavailable (404/5xx/timeout), and fallback models were not usable for this key. Set GEMINI_MODEL in backend/.env to a model available in your account.${probeSummary}`,
+    "GEMINI_MODELS_UNAVAILABLE"
   );
 }
 
@@ -273,7 +444,20 @@ async function inspectIncident({ namespace, selectedPod, tail: _tail, priorAttem
     logs: evidence.logs
   };
   const prompts = buildInspectPrompts({ evidence: compactEvidence, priorAttempt });
-  const ai = await callLLMInspect(prompts);
+  let ai;
+  try {
+    ai = await callLLMInspect(prompts);
+  } catch (err) {
+    if (isTransientProviderFailure(err)) {
+      return buildProviderUnavailableFallback({
+        namespace,
+        selectedPod: evidence.selectedPod,
+        evidence,
+        cause: err?.message || "Transient provider failure"
+      });
+    }
+    throw err;
+  }
 
   const reason = String(ai.one_liner_reason || "").toLowerCase();
   const looksHealthy =
