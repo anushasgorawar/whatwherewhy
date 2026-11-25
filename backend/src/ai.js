@@ -13,25 +13,26 @@ const MAX_EVIDENCE_LOG_CHARS = 2000;
 const AI_HTTP_TIMEOUT_MS = Number(process.env.AI_HTTP_TIMEOUT_MS || 60000);
 
 const inspectResponseSchema = z.object({
-  one_liner_reason: z.string().min(1),
-  details: z.array(z.string()).default([]),
-  confidence_score: z.number().min(0).max(100).optional().nullable(),
-  commands: z
-    .array(
-      z.object({
-        id: z.string().min(1),
-        title: z.string().min(1),
-        command: z.string().min(1),
-        rationale: z.string().min(1),
-        risk: z.enum(["low", "medium", "high"]).default("low"),
-        requires_manual: z.boolean().default(false)
-      })
-    )
-    .default([]),
-  manual_action_required: z.boolean().default(false),
-  manual_action_message: z.string().default(""),
-  risk_level: z.enum(["low", "medium", "high"]).default("low")
+  command: z.string().trim().min(1),
+  explanation: z.string().trim().min(1)
 });
+
+// Sent to the provider so the model output is constrained to exactly these two fields.
+const INSPECT_RESPONSE_JSON_SCHEMA = {
+  type: "object",
+  properties: {
+    command: {
+      type: "string",
+      description: "Exactly one kubectl command to run, scoped with -n <namespace>."
+    },
+    explanation: {
+      type: "string",
+      description: "One or two short sentences: what is wrong and why this command addresses it."
+    }
+  },
+  required: ["command", "explanation"],
+  additionalProperties: false
+};
 
 function trimEvidence(text, maxChars = MAX_EVIDENCE_LOG_CHARS) {
   if (!text) return "";
@@ -110,7 +111,7 @@ function isTransientProviderFailure(err) {
   return msg.includes("timed out");
 }
 
-async function fetchPodLogs(namespace, pod, container, tail = DEFAULT_TAIL) {
+async function fetchPodLogs(namespace, pod, container, tail = DEFAULT_TAIL, previous = false) {
   const { log } = getClients();
   const stream = new PassThrough();
 
@@ -118,7 +119,8 @@ async function fetchPodLogs(namespace, pod, container, tail = DEFAULT_TAIL) {
     follow: false,
     pretty: false,
     timestamps: true,
-    tailLines: tail
+    tailLines: tail,
+    previous
   });
 
   return await new Promise((resolve, reject) => {
@@ -129,6 +131,89 @@ async function fetchPodLogs(namespace, pod, container, tail = DEFAULT_TAIL) {
     stream.on("end", () => resolve(data));
     stream.on("error", (err) => reject(err));
   });
+}
+
+const SENSITIVE_ENV_NAME = /pass|secret|token|key|credential|auth/i;
+
+function describeEnvVar(env) {
+  if (env.valueFrom?.secretKeyRef) return { name: env.name, from: "Secret" };
+  if (env.valueFrom?.configMapKeyRef) {
+    const ref = env.valueFrom.configMapKeyRef;
+    return { name: env.name, from: `ConfigMap ${ref.name}/${ref.key}` };
+  }
+  if (env.valueFrom) return { name: env.name, from: "field or resource reference" };
+  if (SENSITIVE_ENV_NAME.test(env.name)) return { name: env.name, value: "[redacted]" };
+  return { name: env.name, value: String(env.value ?? "").slice(0, 100) };
+}
+
+function describeContainerState(state) {
+  if (!state) return null;
+  if (state.running) return { state: "running" };
+  if (state.waiting) return { state: "waiting", reason: state.waiting.reason || "" };
+  if (state.terminated) {
+    return { state: "terminated", reason: state.terminated.reason || "", exitCode: state.terminated.exitCode };
+  }
+  return null;
+}
+
+async function resolveOwnerDeployment(namespace, rawPod) {
+  const owner = (rawPod.metadata?.ownerReferences || []).find((ref) => ref.controller) || rawPod.metadata?.ownerReferences?.[0];
+  if (!owner) return null;
+  if (owner.kind !== "ReplicaSet") return { kind: owner.kind, name: owner.name };
+  try {
+    const { apps } = getClients();
+    const rs = await apps.readNamespacedReplicaSet({ name: owner.name, namespace });
+    const rsOwner = (rs.metadata?.ownerReferences || []).find((ref) => ref.kind === "Deployment");
+    return rsOwner ? { kind: "Deployment", name: rsOwner.name } : { kind: "ReplicaSet", name: owner.name };
+  } catch (_err) {
+    return { kind: "ReplicaSet", name: owner.name };
+  }
+}
+
+// Compact, Kubernetes-sourced facts about the selected pod (no secret values).
+async function buildPodStatusEvidence(namespace, rawPod) {
+  const statuses = rawPod.status?.containerStatuses || [];
+  const containers = (rawPod.spec?.containers || []).map((c) => {
+    const s = statuses.find((st) => st.name === c.name) || {};
+    return {
+      name: c.name,
+      ready: Boolean(s.ready),
+      restartCount: s.restartCount || 0,
+      currentState: describeContainerState(s.state),
+      lastTermination: describeContainerState(s.lastState),
+      resources: {
+        requests: c.resources?.requests || {},
+        limits: c.resources?.limits || {}
+      },
+      env: (c.env || []).map(describeEnvVar),
+      envFrom: (c.envFrom || []).map((ref) =>
+        ref.configMapRef ? `ConfigMap ${ref.configMapRef.name}` : ref.secretRef ? "Secret" : "other"
+      )
+    };
+  });
+
+  return {
+    phase: rawPod.status?.phase || "Unknown",
+    status: summarizePod(rawPod).status,
+    owner: await resolveOwnerDeployment(namespace, rawPod),
+    containers
+  };
+}
+
+async function fetchPodEvents(namespace, podName) {
+  try {
+    const { core } = getClients();
+    const list = await core.listNamespacedEvent({
+      namespace,
+      fieldSelector: `involvedObject.name=${podName}`
+    });
+    return (list.items || [])
+      .sort((a, b) => new Date(a.lastTimestamp || a.eventTime || 0) - new Date(b.lastTimestamp || b.eventTime || 0))
+      .slice(-10)
+      .map((e) => ({ type: e.type, reason: e.reason, message: String(e.message || "").slice(0, 200), count: e.count || 1 }));
+  } catch (_err) {
+    return [];
+  }
 }
 
 async function collectIncidentEvidence({ namespace, selectedPod, tail = DEFAULT_TAIL }) {
@@ -156,33 +241,56 @@ async function collectIncidentEvidence({ namespace, selectedPod, tail = DEFAULT_
     }
   }
 
+  const rawPod = (podList.items || []).find((item) => item.metadata?.name === fallbackPod);
+  let podStatus = null;
+  let events = [];
+  let previousLogs = "";
+  if (rawPod) {
+    podStatus = await buildPodStatusEvidence(namespace, rawPod);
+    events = await fetchPodEvents(namespace, fallbackPod);
+    const restarted = podStatus.containers.find((c) => c.name === selectedContainer)?.restartCount > 0;
+    if (restarted) {
+      try {
+        previousLogs = await fetchPodLogs(namespace, fallbackPod, selectedContainer, tail, true);
+      } catch (_err) {
+        previousLogs = "";
+      }
+    }
+  }
+
   return {
     namespace,
     selectedPod: fallbackPod,
     selectedContainer,
     pods,
     metrics,
-    logs: trimEvidence(logs)
+    logs: trimEvidence(logs),
+    podStatus,
+    events,
+    previousLogs: trimEvidence(previousLogs)
   };
 }
 
 function buildInspectPrompts({ evidence, priorAttempt }) {
   const systemPrompt = [
     "You are a Kubernetes incident response assistant.",
-    "Return ONLY valid JSON. No markdown.",
-    "Focus on namespace-scoped commands only.",
-    "Use safe kubectl commands and include namespace explicitly using -n <namespace> or --namespace <namespace>.",
-    "Provide at least one executable remediation command unless manual_action_required=true.",
-    "Provide confidence_score as a number from 0 to 100 based only on the evidence quality and consistency.",
-    "Prefer this command set only:",
+    'Return ONLY a JSON object with exactly two fields: {"command": string, "explanation": string}. No markdown.',
+    "command: exactly one kubectl command, the single most useful next step. Prefer a remediation over a diagnostic when the evidence supports one.",
+    "Always include the namespace explicitly using -n <namespace>. No chaining (;, &&, ||) and no pipes.",
+    "Use only these command forms:",
     "kubectl get ... -n <namespace>",
     "kubectl describe ... -n <namespace>",
     "kubectl logs ... -n <namespace>",
     "kubectl rollout restart deployment/<name> -n <namespace>",
     "kubectl set env deployment/<name> KEY=VALUE -n <namespace>",
     "kubectl scale deployment/<name> --replicas=<n> -n <namespace>",
-    "If priorAttempt indicates the previous solution failed, provide materially different next steps.",
-    "Keep one_liner_reason concise and actionable."
+    "kubectl set resources deployment/<name> -c <container> --limits=memory=<n>Mi -n <namespace>",
+    "Use evidence.podStatus first: container lastTermination reason and exitCode, restartCount, resources.limits, env, and evidence.events. Use evidence.previousLogs for what happened just before the last crash.",
+    "For deployment commands, use the deployment name from evidence.podStatus.owner.name, never the pod name.",
+    "If a container's lastTermination or currentState reason is OOMKilled (exit code 137), the explanation must say the container was OOMKilled because it exceeded its memory limit, citing the current limit, and the command must raise that container's memory limit with kubectl set resources. Choose a new limit of at least double the current limit and above any memory target visible in env or logs.",
+    "explanation: at most two short sentences (under 40 words) stating what is wrong and why this command addresses it.",
+    "If priorAttempt includes the output of a previous command, treat it as additional evidence and do not repeat that command; propose the next step.",
+    "If priorAttempt indicates the previous command failed, return a materially different command."
   ].join(" ");
 
   const userPayload = {
@@ -199,45 +307,15 @@ function buildInspectPrompts({ evidence, priorAttempt }) {
 
 function buildProviderUnavailableFallback({ namespace, selectedPod, evidence, cause }) {
   const targetPod = resolvePodName(selectedPod, evidence?.pods || []) || "unknown-pod";
-  const normalizedCause = normalizeProviderErrorMessage(cause);
-  const details = [
-    `AI provider is temporarily unavailable: ${normalizedCause}`,
-    `Continue diagnosis from recent pod evidence for '${targetPod}' in namespace '${namespace}'.`,
-    "Use the suggested low-risk diagnostics below, then retry Inspect."
-  ];
 
   return {
     namespace,
     selectedPod: targetPod,
-    evidence_summary: {
-      pod_count: evidence?.pods?.length || 0,
-      metric_rows: evidence?.metrics?.length || 0
-    },
-    one_liner_reason: "AI provider unavailable; proceed with manual, evidence-first diagnostics.",
-    details,
-    confidence_score: null,
-    commands: [
-      {
-        id: "fallback-describe",
-        title: "Inspect pod events and failure reasons",
-        command: `kubectl describe pod ${targetPod} -n ${namespace}`,
-        rationale: "Describe output usually reveals immediate scheduling, image, probe, or restart causes.",
-        risk: "low",
-        requires_manual: false
-      },
-      {
-        id: "fallback-logs",
-        title: "Fetch recent logs for the selected pod",
-        command: `kubectl logs ${targetPod} -n ${namespace} --tail=100`,
-        rationale: "Recent logs provide direct error context while AI service is unavailable.",
-        risk: "low",
-        requires_manual: false
-      }
-    ],
-    manual_action_required: false,
-    manual_action_message: "",
-    risk_level: "medium",
-    degraded_mode: true
+    command: `kubectl describe pod ${targetPod} -n ${namespace}`,
+    explanation:
+      "AI provider is unavailable, so no diagnosis was generated. Pod events and the last termination reason usually show the immediate cause.",
+    degraded_mode: true,
+    degraded_reason: normalizeProviderErrorMessage(cause)
   };
 }
 
@@ -259,7 +337,10 @@ async function callOpenAIInspect({ systemPrompt, userPrompt }) {
           { role: "system", content: systemPrompt },
           { role: "user", content: userPrompt }
         ],
-        response_format: { type: "json_object" }
+        response_format: {
+          type: "json_schema",
+          json_schema: { name: "inspect_command", strict: true, schema: INSPECT_RESPONSE_JSON_SCHEMA }
+        }
       },
       {
         headers: {
@@ -342,7 +423,8 @@ async function callGeminiInspect({ systemPrompt, userPrompt }) {
         () =>
           ai.interactions.create({
             model,
-            input: mergedInput
+            input: mergedInput,
+            response_format: { type: "text", mime_type: "application/json", schema: INSPECT_RESPONSE_JSON_SCHEMA }
           }),
         AI_HTTP_TIMEOUT_MS,
         `Gemini request timed out after ${AI_HTTP_TIMEOUT_MS}ms. Retry Inspect or increase AI_HTTP_TIMEOUT_MS in backend/.env.`
@@ -440,8 +522,11 @@ async function inspectIncident({ namespace, selectedPod, tail: _tail, priorAttem
   const compactEvidence = {
     namespace: evidence.namespace,
     selectedPod: evidence.selectedPod,
+    podStatus: evidence.podStatus,
+    events: evidence.events,
     metrics: (evidence.metrics || []).filter((metric) => metric.pod === evidence.selectedPod),
-    logs: evidence.logs
+    logs: evidence.logs,
+    previousLogs: evidence.previousLogs
   };
   const prompts = buildInspectPrompts({ evidence: compactEvidence, priorAttempt });
   let ai;
@@ -459,41 +544,38 @@ async function inspectIncident({ namespace, selectedPod, tail: _tail, priorAttem
     throw err;
   }
 
-  const reason = String(ai.one_liner_reason || "").toLowerCase();
-  const looksHealthy =
-    reason.includes("healthy") ||
-    reason.includes("stable") ||
-    reason.includes("no issue") ||
-    reason.includes("normal operation");
-
-  if (looksHealthy) {
-    ai.manual_action_required = false;
-    ai.manual_action_message = "";
-    ai.risk_level = "low";
-  }
-
-  if (!looksHealthy && !ai.manual_action_required && (!ai.commands || ai.commands.length === 0)) {
-    const targetPod = evidence.selectedPod || evidence.pods[0]?.name || "unknown-pod";
-    ai.commands = [
-      {
-        id: "fallback-describe",
-        title: "Inspect pod events and failure reasons",
-        command: `kubectl describe pod ${targetPod} -n ${namespace}`,
-        rationale: "No executable fix command was returned; start with explicit pod diagnostics.",
-        risk: "low",
-        requires_manual: false
-      }
-    ];
-  }
   return {
     namespace,
     selectedPod: evidence.selectedPod,
-    evidence_summary: {
-      pod_count: evidence.pods.length,
-      metric_rows: evidence.metrics.length
-    },
-    ...ai
+    command: ai.command,
+    explanation: ai.explanation
   };
+}
+
+// Only memory/CPU requests and limits on a deployment, optionally for one container.
+function isAllowedSetResources(command) {
+  const match = /^kubectl\s+set\s+resources\s+deployment\/[a-z0-9-]+((?:\s+\S+)+)$/i.exec(command);
+  if (!match) return false;
+  const tokens = match[1].trim().split(/\s+/);
+  const quantity = "\\d+(?:Mi|Gi|m)?";
+  const resourceFlag = new RegExp(
+    `^--(limits|requests)=(memory|cpu)=${quantity}(,(memory|cpu)=${quantity})?$`
+  );
+  let hasLimitOrRequest = false;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (token === "-c" || token === "-n" || token === "--namespace") {
+      if (!/^[a-z0-9-]+$/.test(tokens[i + 1] || "")) return false;
+      i += 1;
+    } else if (/^--containers=[a-z0-9-]+$/.test(token)) {
+      continue;
+    } else if (resourceFlag.test(token)) {
+      hasLimitOrRequest = true;
+    } else {
+      return false;
+    }
+  }
+  return hasLimitOrRequest;
 }
 
 function validateCommandForExecution(command, namespace) {
@@ -521,7 +603,8 @@ function validateCommandForExecution(command, namespace) {
     /^kubectl\s+logs\s+/i.test(trimmed) ||
     /^kubectl\s+rollout\s+restart\s+deployment\/[a-z0-9-]+/i.test(trimmed) ||
     /^kubectl\s+set\s+env\s+deployment\/[a-z0-9-]+\s+/i.test(trimmed) ||
-    /^kubectl\s+scale\s+deployment\/[a-z0-9-]+\s+--replicas=\d+/i.test(trimmed);
+    /^kubectl\s+scale\s+deployment\/[a-z0-9-]+\s+--replicas=\d+/i.test(trimmed) ||
+    isAllowedSetResources(trimmed);
 
   if (allowedFamily) {
     return { allowed: true };

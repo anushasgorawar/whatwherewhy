@@ -14,7 +14,7 @@ const port = process.env.PORT || 8080;
 
 app.use(cors());
 app.use(express.json());
-app.use(morgan("combined"));
+app.use(morgan("combined", { skip: (_req, res) => res.statusCode < 400 }));
 app.use("/assets/fonts", express.static(path.resolve(__dirname, "../exwayer")));
 
 const namespaceSchema = z.object({
@@ -36,6 +36,7 @@ const aiInspectSchema = z.object({
     .object({
       previousReason: z.string().optional(),
       previousCommands: z.array(z.string()).optional(),
+      previousOutput: z.string().max(4000).optional(),
       feedback: z.string().optional()
     })
     .optional()
@@ -262,7 +263,7 @@ app.get("/api/dashboard/summary", async (req, res) => {
     }
 
     const rawPods = list.items || [];
-    const runningPods = pods.filter((pod) => pod.phase === "Running").length;
+    const runningPods = pods.filter((pod) => pod.status === "Running").length;
     const needsAttentionPodItems = rawPods.filter((pod) => podHasIssues(pod));
     const needsAttentionPodNames = needsAttentionPodItems
       .map((pod) => pod?.metadata?.name)

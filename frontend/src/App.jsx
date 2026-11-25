@@ -10,10 +10,7 @@ import {
   ChevronUp,
   Circle,
   Clock3,
-  Cpu,
-  Eye,
   FileCode2,
-  HardDrive,
   Loader2,
   Logs,
   PlayCircle,
@@ -27,7 +24,6 @@ import {
   fetchClusterStatus,
   fetchDashboardSummary,
   fetchLogs,
-  fetchNamespaceMetricsSummary,
   fetchNamespaces,
   fetchPodMetrics,
   fetchPods,
@@ -40,6 +36,7 @@ const MAX_HISTORY_POINTS = 30;
 
 function formatBytesMiBToHuman(memoryMiBString) {
   const value = Number(memoryMiBString || 0);
+  if (Number.isNaN(value)) return "n/a";
   if (value >= 1024) {
     return `${(value / 1024).toFixed(2)} GiB`;
   }
@@ -58,9 +55,6 @@ export default function App() {
   const [namespaces, setNamespaces] = useState([]);
   const [pods, setPods] = useState([]);
   const [metrics, setMetrics] = useState([]);
-  const [namespaceSummary, setNamespaceSummary] = useState([]);
-  const [globalCpuTotal, setGlobalCpuTotal] = useState("0.0000");
-  const [globalMemoryTotal, setGlobalMemoryTotal] = useState("0.00");
   const [selectedPod, setSelectedPod] = useState("");
   const [expandedPod, setExpandedPod] = useState("");
   const [activeTab, setActiveTab] = useState("metrics");
@@ -86,6 +80,7 @@ export default function App() {
   const [podFilter, setPodFilter] = useState("all");
   const [namespaceMenuOpen, setNamespaceMenuOpen] = useState(false);
   const [aiLoading, setAiLoading] = useState(false);
+  const [inspectingPod, setInspectingPod] = useState("");
   const [aiExecuting, setAiExecuting] = useState(false);
   const [aiResult, setAiResult] = useState(null);
   const [aiExecutionResult, setAiExecutionResult] = useState(null);
@@ -143,16 +138,6 @@ export default function App() {
     return podsWithMetrics;
   }, [podFilter, dashboardSummary.needsAttentionPodNames, dashboardSummary.highCpuPodNames, podsWithMetrics]);
 
-  const namespaceCpuTotal = useMemo(
-    () => metrics.reduce((sum, metric) => sum + Number(metric.cpuCores || 0), 0).toFixed(4),
-    [metrics]
-  );
-
-  const namespaceMemoryTotal = useMemo(
-    () => metrics.reduce((sum, metric) => sum + Number(metric.memoryMiB || 0), 0).toFixed(2),
-    [metrics]
-  );
-
   const aiSteps = useMemo(
     () => [
       { id: "inspect", label: "Inspect evidence", state: aiResult ? "done" : aiLoading ? "active" : "upcoming" },
@@ -169,7 +154,7 @@ export default function App() {
   const podEvents = useMemo(() => {
     if (!selectedPodRow) return [];
     const events = [
-      `Status is ${selectedPodRow.phase}`,
+      `Status is ${selectedPodRow.status || selectedPodRow.phase}`,
       `Restart count is ${selectedPodRow.restarts}`,
       `CPU usage observed at ${selectedPodRow.cpuCores} cores`,
       `Memory usage observed at ${selectedPodRow.memoryMiB} MiB`
@@ -205,19 +190,12 @@ export default function App() {
   async function refreshPodsAndMetrics() {
     try {
       setLoadingData(true);
-      const [podData, metricData, nsSummaryData] = await Promise.all([
-        fetchPods(namespace),
-        fetchPodMetrics(namespace),
-        fetchNamespaceMetricsSummary()
-      ]);
+      const [podData, metricData] = await Promise.all([fetchPods(namespace), fetchPodMetrics(namespace)]);
 
       const nextPods = podData.pods || [];
       setPods(nextPods);
       setMetrics(metricData.metrics || []);
       setMetricsSource(metricData.source || "unknown");
-      setNamespaceSummary(nsSummaryData.namespaces || []);
-      setGlobalCpuTotal(nsSummaryData.totalCpuCores || "0.0000");
-      setGlobalMemoryTotal(nsSummaryData.totalMemoryMiB || "0.00");
 
       try {
         const summaryData = await fetchDashboardSummary(namespace);
@@ -256,11 +234,10 @@ export default function App() {
         setClusterStatusCheckedAt(new Date().toISOString());
       }
 
-      if (nextPods.length && !nextPods.some((pod) => pod.name === selectedPod)) {
-        setSelectedPod(nextPods[0].name);
-      } else if (!nextPods.length) {
-        setSelectedPod("");
-      }
+      // Functional update: this runs from a polling interval whose closure holds a stale selectedPod.
+      setSelectedPod((prev) =>
+        nextPods.some((pod) => pod.name === prev) ? prev : nextPods[0]?.name || ""
+      );
     } catch (err) {
       setError(err.message || "Failed to refresh pods and metrics.");
     } finally {
@@ -298,7 +275,10 @@ export default function App() {
     const targetPod = podOverride || selectedPod;
     if (!targetPod) return;
     setAiLoading(true);
-    setAiExecutionResult(null);
+    setInspectingPod(targetPod);
+    if (!priorAttempt?.previousOutput) {
+      setAiExecutionResult(null);
+    }
     setError("");
     try {
       const result = await inspectWithAI({
@@ -320,28 +300,45 @@ export default function App() {
       setError(err.message || "AI inspect failed.");
     } finally {
       setAiLoading(false);
+      setInspectingPod("");
     }
   }
 
   async function runFixIt() {
-    if (!aiResult?.commands?.length) return;
+    if (!aiResult?.command) return;
+    const approvedCommand = aiResult.command;
+    const targetPod = aiResult?.selectedPod || selectedPod;
     setAiExecuting(true);
     setError("");
+    let followUp = null;
     try {
-      const executable = aiResult.commands.filter((cmd) => !cmd.requires_manual);
       const result = await executeAISuggestion({
         namespace,
-        commands: executable.map((cmd) => ({ id: cmd.id, command: cmd.command }))
+        commands: [{ id: "ai-command", command: approvedCommand }]
       });
       setAiExecutionResult(result);
       await refreshPodsAndMetrics();
-      if (selectedPod) {
-        await refreshLogsForPod(selectedPod, false);
+      if (targetPod) {
+        await refreshLogsForPod(targetPod, false);
+      }
+      const executed = result?.results?.[0];
+      // Read-only commands produce evidence for the next step; remediations change the pod, so the
+      // operator re-runs Investigate once the rollout has settled.
+      const isReadOnly = /^kubectl\s+(get|describe|logs)\b/.test(approvedCommand);
+      if (isReadOnly && executed?.status === "success" && executed.stdout) {
+        followUp = {
+          previousCommands: [approvedCommand],
+          previousOutput: executed.stdout.slice(0, 4000),
+          feedback: "The approved command ran successfully; its output is attached. Use it as evidence and propose the next step."
+        };
       }
     } catch (err) {
       setError(err.message || "AI execute failed.");
     } finally {
       setAiExecuting(false);
+    }
+    if (followUp && targetPod) {
+      await runInspect(followUp, targetPod);
     }
   }
 
@@ -536,65 +533,6 @@ export default function App() {
               </div>
             </section>
 
-            <section className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-              <div className="rounded-card border border-[#DBEAFE] bg-[#F8FBFF] p-4 shadow-soft">
-                <div className="mb-3 flex items-center justify-between">
-                  <h2 className="text-sm font-semibold text-[#0F172A]">{namespace} (Current Usage)</h2>
-                  <span className="rounded-full border border-[#DBEAFE] bg-[#EFF6FF] px-2 py-0.5 text-xs text-[#1D4ED8]">
-                    Namespace
-                  </span>
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="rounded-nested border border-[#BFDBFE] bg-[#EFF6FF] p-3">
-                    <div className="mb-2 flex items-center gap-2 text-[#64748B]">
-                      <span className="rounded-md bg-[#EAF2FF] p-1">
-                        <Cpu className="h-4 w-4 text-[#0969F9]" />
-                      </span>
-                      <span className="text-sm font-medium">CPU Usage</span>
-                    </div>
-                    <p className="text-lg font-semibold text-[#0F172A]">{namespaceCpuTotal} cores</p>
-                  </div>
-                  <div className="rounded-nested border border-[#E9D5FF] bg-[#FAF5FF] p-3">
-                    <div className="mb-2 flex items-center gap-2 text-[#64748B]">
-                      <span className="rounded-md bg-[#F3E8FF] p-1">
-                        <HardDrive className="h-4 w-4 text-[#7C3AED]" />
-                      </span>
-                      <span className="text-sm font-medium">Memory Usage</span>
-                    </div>
-                    <p className="text-lg font-semibold text-[#0F172A]">{formatBytesMiBToHuman(namespaceMemoryTotal)}</p>
-                  </div>
-                </div>
-              </div>
-              <div className="rounded-card border border-[#E2E8F0] bg-[#FCFCFD] p-4 shadow-soft">
-                <div className="mb-3 flex items-center justify-between">
-                  <h2 className="text-sm font-semibold text-[#0F172A]">Cluster (Current Usage)</h2>
-                  <span className="rounded-full border border-[#E2E8F0] bg-[#F8FAFC] px-2 py-0.5 text-xs text-[#64748B]">
-                    All Namespaces
-                  </span>
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="rounded-nested border border-[#BFDBFE] bg-[#EFF6FF] p-3">
-                    <div className="mb-2 flex items-center gap-2 text-[#64748B]">
-                      <span className="rounded-md bg-[#EAF2FF] p-1">
-                        <Cpu className="h-4 w-4 text-[#0969F9]" />
-                      </span>
-                      <span className="text-sm font-medium">CPU Usage</span>
-                    </div>
-                    <p className="text-lg font-semibold text-[#0F172A]">{globalCpuTotal} cores</p>
-                  </div>
-                  <div className="rounded-nested border border-[#E9D5FF] bg-[#FAF5FF] p-3">
-                    <div className="mb-2 flex items-center gap-2 text-[#64748B]">
-                      <span className="rounded-md bg-[#F3E8FF] p-1">
-                        <HardDrive className="h-4 w-4 text-[#7C3AED]" />
-                      </span>
-                      <span className="text-sm font-medium">Memory Usage</span>
-                    </div>
-                    <p className="text-lg font-semibold text-[#0F172A]">{formatBytesMiBToHuman(globalMemoryTotal)}</p>
-                  </div>
-                </div>
-              </div>
-            </section>
-
             <section className="rounded-card border border-[#E2E8F0] bg-white p-4 shadow-soft">
               <div className="mb-3 flex items-center justify-between">
                 <h2 className="text-base font-semibold text-[#0F172A]">Pods</h2>
@@ -618,40 +556,63 @@ export default function App() {
                   </thead>
                   <tbody className="divide-y divide-[#E2E8F0] bg-white">
                     {displayedPods.map((pod) => {
-                      const isRunning = pod.phase === "Running";
+                      const status = pod.status || pod.phase;
+                      const isRunning = status === "Running";
+                      const canInspect = !isRunning && status !== "Succeeded" && status !== "Completed";
                       const isExpanded = expandedPod === pod.name;
+                      const isInspecting = aiLoading && inspectingPod === pod.name;
+                      const isInsightSubject =
+                        isInspecting || (showAiInsight && !aiLoading && aiResult?.selectedPod === pod.name);
                       return (
                         <Fragment key={pod.name}>
-                          <tr className={`text-[#0F172A] ${isExpanded ? "bg-[#F8FAFC]" : "bg-white"}`}>
-                            <td className="px-3 py-2 font-medium">{pod.name}</td>
-                            <td className="px-3 py-2">
-                              <span
-                                className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
-                                  isRunning
-                                    ? "bg-[#ECFDF3] text-[#16A34A]"
-                                    : "bg-[#FEF3C7] text-[#B45309]"
-                                }`}
-                              >
-                                {pod.phase}
+                          <tr
+                            className={`text-[#0F172A] transition-colors ${
+                              isInsightSubject ? "bg-[#DBEAFE]" : isExpanded ? "bg-[#F8FAFC]" : "bg-white"
+                            }`}
+                          >
+                            <td
+                              className={`px-3 py-2 font-medium ${isInsightSubject ? "shadow-[inset_4px_0_0_#0969F9]" : ""}`}
+                            >
+                              <span className="inline-flex items-center gap-2">
+                                {isInspecting && <Loader2 className="h-3.5 w-3.5 animate-spin text-[#0969F9]" />}
+                                {pod.name}
                               </span>
+                            </td>
+                            <td className="px-3 py-2">
+                              <div className="flex items-center gap-3">
+                                <span
+                                  className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
+                                    isRunning
+                                      ? "bg-[#ECFDF3] text-[#16A34A]"
+                                      : "bg-[#FEF3C7] text-[#B45309]"
+                                  }`}
+                                >
+                                  {status}
+                                </span>{" "}
+                                {pod.ready && <span className="whitespace-nowrap text-xs text-[#64748B]">{pod.ready} ready</span>}
+                              </div>
                             </td>
                             <td className="px-3 py-2">{pod.cpuCores} cores</td>
                             <td className="px-3 py-2">{formatBytesMiBToHuman(pod.memoryMiB)}</td>
                             <td className="px-3 py-2">{pod.restarts}</td>
                             <td className="px-3 py-2">
-                              <button
-                                type="button"
-                                className="rounded-btn border border-[#BFDBFE] bg-[#EFF6FF] px-2 py-1 text-xs font-medium text-[#1D4ED8] disabled:opacity-60"
-                                disabled={aiLoading}
-                                onClick={() => {
-                                  setSelectedPod(pod.name);
-                                  setShowAiInsight(true);
-                                  setAiInsightExpanded(true);
-                                  runInspect(undefined, pod.name);
-                                }}
-                              >
-                                {aiLoading && selectedPod === pod.name ? "Inspecting..." : "Inspect"}
-                              </button>
+                              {canInspect ? (
+                                <button
+                                  type="button"
+                                  className="rounded-btn border border-[#BFDBFE] bg-[#EFF6FF] px-2 py-1 text-xs font-medium text-[#1D4ED8] disabled:opacity-60"
+                                  disabled={aiLoading}
+                                  onClick={() => {
+                                    setSelectedPod(pod.name);
+                                    setShowAiInsight(true);
+                                    setAiInsightExpanded(true);
+                                    runInspect(undefined, pod.name);
+                                  }}
+                                >
+                                  {isInspecting ? "Inspecting..." : "Inspect"}
+                                </button>
+                              ) : (
+                                <span className="text-xs text-[#94A3B8]">—</span>
+                              )}
                             </td>
                             <td className="px-3 py-2">
                               <button
@@ -916,33 +877,24 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="mb-4 rounded-nested border border-[#E2E8F0] bg-[#F8FAFC] p-3">
-                      <h3 className="mb-2 text-sm font-semibold text-[#0F172A]">Key Evidence</h3>
-                      <ul className="space-y-1 text-sm text-[#475569]">
-                        {(aiResult?.details?.length ? aiResult.details : ["No evidence summary available."])
-                          .slice(0, 3)
-                          .map((item) => (
-                          <li key={item} className="flex items-start gap-2">
-                            <Eye className="mt-0.5 h-4 w-4 text-[#64748B]" />
-                            <span>{item}</span>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-
                     <div
                       className={`mb-4 rounded-nested border p-3 text-sm ${
-                        !aiResult
-                          ? "border-[#E2E8F0] bg-[#F8FAFC] text-[#334155]"
-                          : aiResult.risk_level === "high"
-                          ? "border-[#FECACA] bg-[#FEF2F2] text-[#991B1B]"
-                          : aiResult.risk_level === "medium"
-                            ? "border-[#FDE68A] bg-[#FFFBEB] text-[#92400E]"
-                            : "border-[#DCFCE7] bg-[#F0FDF4] text-[#166534]"
+                        aiResult?.degraded_mode
+                          ? "border-[#FDE68A] bg-[#FFFBEB] text-[#92400E]"
+                          : "border-[#E2E8F0] bg-[#F8FAFC] text-[#334155]"
                       }`}
                     >
-                      <h3 className="mb-1 font-semibold">Likely Root Cause</h3>
-                      <p>{aiResult?.one_liner_reason || "Diagnosis not available yet."}</p>
+                      <h3 className="mb-2 font-semibold text-[#0F172A]">Command to Run</h3>
+                      {aiResult?.command ? (
+                        <>
+                          <pre className="mb-2 overflow-x-auto whitespace-pre-wrap break-all rounded-btn bg-[#17202D] p-2 font-mono text-xs text-[#E2E8F0]">
+                            {aiResult.command}
+                          </pre>
+                          <p>{aiResult.explanation}</p>
+                        </>
+                      ) : (
+                        <p>Diagnosis not available yet.</p>
+                      )}
                     </div>
 
                     <div>
@@ -950,15 +902,15 @@ export default function App() {
                       <div className="grid grid-cols-1 gap-2">
                         <button
                           className="inline-flex items-center justify-center gap-2 rounded-btn bg-[#0969F9] px-3 py-2 text-sm font-medium text-white disabled:opacity-60"
-                          disabled={aiLoading || !selectedPod}
-                          onClick={() => runInspect()}
+                          disabled={aiLoading || !(aiResult?.selectedPod || selectedPod)}
+                          onClick={() => runInspect(undefined, aiResult?.selectedPod)}
                         >
                           {aiLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlayCircle className="h-4 w-4" />}
                           Investigate
                         </button>
                         <button
                           className="inline-flex items-center justify-center gap-2 rounded-btn border border-[#E2E8F0] bg-white px-3 py-2 text-sm font-medium text-[#0F172A] disabled:opacity-60"
-                          disabled={aiExecuting || !aiResult?.commands?.length}
+                          disabled={aiExecuting || !aiResult?.command}
                           onClick={runFixIt}
                         >
                           {aiExecuting ? <Loader2 className="h-4 w-4 animate-spin text-[#0969F9]" /> : <ShieldCheck className="h-4 w-4 text-[#16A34A]" />}
@@ -966,10 +918,15 @@ export default function App() {
                         </button>
                         <button
                           className="inline-flex items-center justify-center gap-2 rounded-btn border border-[#E2E8F0] bg-white px-3 py-2 text-sm font-medium text-[#0F172A] disabled:opacity-60"
-                          disabled={!selectedPod}
-                          onClick={() => {
-                            setExpandedPod(selectedPod);
+                          disabled={!(aiResult?.selectedPod || selectedPod)}
+                          onClick={async () => {
+                            const targetPod = aiResult?.selectedPod || selectedPod;
+                            setSelectedPod(targetPod);
+                            setExpandedPod(targetPod);
                             setActiveTab("logs");
+                            setActiveLogPod(targetPod);
+                            setLogsPollingEnabled(true);
+                            await refreshLogsForPod(targetPod, true);
                           }}
                         >
                           <Logs className="h-4 w-4 text-[#64748B]" />
@@ -988,6 +945,11 @@ export default function App() {
                                 {r.status} - {r.command}
                               </p>
                               {r.reason && <p className="text-[#B45309]">{r.reason}</p>}
+                              {r.stdout && (
+                                <pre className="log-scrollbar mt-1 max-h-48 overflow-auto whitespace-pre-wrap rounded-btn bg-[#17202D] p-2 font-mono text-[11px] leading-relaxed text-[#E2E8F0]">
+                                  {r.stdout}
+                                </pre>
+                              )}
                               {r.stderr && <p className="font-mono text-[#EF4444]">{r.stderr}</p>}
                             </div>
                           ))}

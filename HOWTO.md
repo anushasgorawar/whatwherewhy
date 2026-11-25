@@ -380,6 +380,133 @@ The AI Insight side panel now uses:
 
 No backend restart is needed for this UI-only control update; refresh the frontend page if it is already open.
 
+### Aggregate usage cards removed
+
+The namespace "(Current Usage)" and "Cluster (Current Usage)" cards are no longer rendered, and the frontend no longer polls `/api/metrics/namespaces-summary`. The endpoint still exists for direct checks:
+
+```bash
+curl http://localhost:8080/api/metrics/namespaces-summary
+```
+
+No backend restart is needed; the Vite dev server hot-reloads the change (refresh the page if it is already open).
+
+### Inspect button visibility
+
+In the Pods table, the **Inspect** button is shown only for pods whose phase is not `Running` and not `Succeeded` (for example `Pending`, `Failed`, `Unknown`). Healthy rows show `—` instead. Frontend-only change; Vite hot-reloads it. To get an inspectable pod for testing:
+
+```bash
+# image that cannot be pulled -> pod stays in phase Pending
+kubectl -n simulation run inspect-test --image=does-not-exist.invalid/none:0
+kubectl -n simulation get pod inspect-test
+# cleanup
+kubectl -n simulation delete pod inspect-test
+```
+
+Note: the rule uses the container-aware status (see "Pod status matches `kubectl get pods`" below), so crashloop, OOM, and config scenarios show the Inspect button. The readiness scenario shows `Running` with `0/1 ready`, so it does not.
+
+### Inspect evidence, memory-limit fix, and follow-up loop
+
+Inspect now sends the LLM, for the selected pod only:
+- `podStatus`: status, owning deployment, and per container: current state, last termination reason and exit code (e.g. `OOMKilled` / `137`), restart count, resource requests/limits, env var names and values (secret-backed values and names matching pass/secret/token/key/credential/auth are not sent).
+- `events`: last 10 Kubernetes events for the pod.
+- `logs` (current container) and `previousLogs` (crashed container, when it has restarted), last 20 lines each.
+
+The AI may now propose, and the allowlist accepts, `kubectl set resources deployment/<name> [-c <container>] --limits=memory=<n>Mi -n <namespace>` (memory/CPU requests and limits only). For an OOMKilled container the prompt requires naming the OOMKill and the current limit and proposing a raised limit.
+
+After **Approve**, the command's output is shown under Execution Feedback. If the approved command was read-only (`get`, `describe`, `logs`), Inspect re-runs automatically with that output attached as `priorAttempt.previousOutput`, and the next suggestion still requires approval. After a remediation, click **Investigate** once the rollout settles.
+
+Backend `npm run dev` reloads automatically. Verify against the memory scenario:
+
+```bash
+cd /Users/anushasg/www
+./scripts/simulate.sh start memory
+# wait for OOMKilled / CrashLoopBackOff
+kubectl -n simulation get pods -l app=memory-simulator
+
+curl -s -X POST http://localhost:8080/api/ai/inspect \
+  -H "Content-Type: application/json" \
+  -d '{"namespace":"simulation","selectedPod":"memory-simulator"}' | jq '{command, explanation}'
+
+# preview the suggested change without applying it
+kubectl -n simulation set resources deployment/memory-simulator -c simulator --limits=memory=128Mi --dry-run=server -o jsonpath='{.spec.template.spec.containers[0].resources}'
+```
+
+Expected: an explanation naming `OOMKilled` and the 48Mi limit, and a `kubectl set resources ... --limits=memory=<n>Mi` command. Note `./scripts/simulate.sh start memory` does not reset the memory limit; to restore 48Mi after applying the fix:
+
+```bash
+kubectl -n simulation set resources deployment/memory-simulator -c simulator --limits=memory=48Mi
+```
+
+### Inspect progress highlight
+
+While Inspect runs, the inspected pod's row in the Pods table is highlighted (light blue background, blue left bar, spinner next to the pod name) and its button reads "Inspecting...". After the response arrives, the row stays highlighted (without the spinner) for as long as the AI Insight panel is open, including when collapsed; closing the panel clears it. Pods without metrics now show `n/a` for memory instead of `NaN MiB`. Frontend-only change; Vite hot-reloads it.
+
+### AI Inspect response: one command + short explanation
+
+`POST /api/ai/inspect` now returns exactly one command and a short explanation. The shape is enforced by the provider (OpenAI `response_format: json_schema` with `strict: true`; Gemini interactions `response_format` with a JSON schema) and validated again in the backend.
+
+```json
+{
+  "namespace": "simulation",
+  "selectedPod": "memory-simulator-675d9dc5c6-cwdnn",
+  "command": "kubectl describe pod memory-simulator-675d9dc5c6-cwdnn -n simulation",
+  "explanation": "One or two sentences on what is wrong and why this command addresses it."
+}
+```
+
+In degraded mode (provider unavailable) the response also includes `"degraded_mode": true` and `"degraded_reason"`.
+
+The AI Insight panel shows the command in a code block with the explanation under "Command to Run", before the operator clicks **Approve**. Approve sends that single command to `/api/ai/execute`.
+
+Restart the backend if it runs with `npm start` (`npm run dev` reloads automatically). Verify:
+
+```bash
+curl -s -X POST http://localhost:8080/api/ai/inspect \
+  -H "Content-Type: application/json" \
+  -d '{"namespace":"simulation","selectedPod":"memory-simulator"}' | jq '{command, explanation}'
+```
+
+### AI Insight: Key Evidence block removed
+
+The AI Insight panel no longer renders the "Key Evidence" list; "Likely Root Cause" (`one_liner_reason`) is the single diagnosis summary. The backend still returns `details` in `/api/ai/inspect` responses for direct inspection. Frontend-only change; Vite hot-reloads it.
+
+### Pod status matches `kubectl get pods`
+
+The Pods table now shows the same STATUS value as `kubectl get pods` (for example `CrashLoopBackOff`, `OOMKilled`, `ImagePullBackOff`, `Completed`) plus a ready count (`0/1 ready`), instead of the raw pod phase. The raw phase stays `Running` while a Deployment restarts a crashing container, which hid failures. The Inspect button and the "Pods Running" card use this status.
+
+Backend `npm run dev` reloads automatically; with `npm start`, restart the backend. Verify:
+
+```bash
+curl -s "http://localhost:8080/api/pods?namespace=simulation" | jq -c '.pods[] | {name, status, ready, phase}'
+kubectl -n simulation get pods
+```
+
+Reproduce a mismatch case:
+
+```bash
+cd /Users/anushasg/www
+./scripts/simulate.sh start memory    # pod cycles OOMKilled / CrashLoopBackOff while phase stays Running
+```
+
+Note: between restarts the container briefly runs, so both `kubectl` and the UI can momentarily show `Running` for a crash-looping pod.
+
+### Backend request logging (errors only)
+
+The backend now logs HTTP requests only when the response status is `>= 400`; successful polling requests (`200`/`304`) are not printed. The startup line `pod-observer backend listening on port 8080` is still printed once.
+
+Restart to apply (`npm start` does not auto-reload):
+
+```bash
+cd /Users/anushasg/www/backend
+npm start
+```
+
+To see a logged error line, request an unknown route:
+
+```bash
+curl -s http://localhost:8080/api/does-not-exist >/dev/null
+```
+
 ## 13) Gemini API evidence-first smoke test
 
 Use this script to avoid guesswork and verify exactly what Gemini models are available for your API key with a tiny prompt.
